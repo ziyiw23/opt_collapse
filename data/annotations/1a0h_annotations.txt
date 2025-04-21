@@ -1,0 +1,28 @@
+Searching 1 PDBs against database of size 25407, representing 1870 functional sites
+Input PDB: 1a0h
+Annotating chains: AB
+Results at p =  0.0001
+ Kringle domain signature. (PROSITE)
+    - A_C219: 3 PDBs
+    - A_C243: 1 PDBs
+ Serine proteases, trypsin family, histidine active site. (PROSITE)
+    - B_A361: 70 PDBs
+    - B_H363: 27 PDBs
+    - B_C364: 7 PDBs
+ trypsin (M-CSA)
+    - B_H363: 1 PDBs
+    - B_D419: 1 PDBs
+    - B_G523: 1 PDBs
+    - B_D524: 1 PDBs
+    - B_S525: 1 PDBs
+ t-plasminogen activator (M-CSA)
+    - B_D419: 1 PDBs
+ classical-complement-pathway C3/C5 convertase (M-CSA)
+    - B_D419: 1 PDBs
+    - B_S525: 1 PDBs
+ Serine proteases, trypsin family, serine active site. (PROSITE)
+    - B_G523: 4 PDBs
+    - B_S525: 29 PDBs
+    - B_G526: 62 PDBs
+ plasmin (M-CSA)
+    - B_G526: 1 PDBs

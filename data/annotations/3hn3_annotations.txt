@@ -1,0 +1,2 @@
+Searching 1 PDBs against database of size 25407, representing 1870 functional sites
+Out of Memory error!

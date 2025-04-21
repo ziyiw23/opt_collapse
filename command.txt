@@ -1,0 +1,1 @@
+python eval_scripts/compare_embed.py --original /scratch/groups/rbaltman/ziyiw23/clps_embed/ori_res --optimized /scratch/groups/rbaltman/ziyiw23/clps_embed/opt_res
