@@ -1,91 +1,48 @@
+# V2.4 - DataLoader Parallelism
+
 import numpy as np
 import os
 import argparse
 import torch
 import pandas as pd
-from atom3d.datasets import load_dataset, make_lmdb_dataset
+# Use atom3d.datasets.LMDBDataset if reading from LMDB, or parse files directly/use atom3d.dataset.FileDataset
+from atom3d.datasets import load_dataset, make_lmdb_dataset# Check exact function if needed
 import atom3d.util.file as fi
-# Assuming collapse and atom_info are correctly importable
-from collapse import initialize_model, atom_info
+from collapse import initialize_model, atom_info # Assuming these are correct
 from atom3d.filters.filters import first_model_filter
-from collapse.data import embed_residue
 import collections as col
 import random
 import torch_cluster
 from torch_geometric.data import Batch, Data
-import torch_scatter
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence # Might be useful for metadata if needed
+import lmdb # For manual LMDB writing
+import pickle # For LMDB serialization
+from tqdm import tqdm # Progress bar
+
 import time
 import sys
-import multiprocessing
 
-def init_worker(df_global):
-    """Initializer for multiprocessing pool workers."""
-    global global_atom_df
-    global_atom_df = df_global
-
-# Define this function globally
-def process_residue_center(residue_info_tuple):
-    """
-    Worker function to calculate center for a single residue.
-    Accesses global_atom_df initialized by init_worker.
-    """
-    chain, resnum, resname_letter = residue_info_tuple
-
-    if resname_letter == 'X':
-        return (residue_info_tuple, None) # Skip 'X' residues
-
-    # Access the global DataFrame (read-only access is safe)
-    if 'global_atom_df' not in globals():
-         # Safety check in case initializer failed (shouldn't happen with Pool)
-         print("Error: global_atom_df not initialized in worker.")
-         return (residue_info_tuple, None)
-
-    try:
-        # Filter the global DataFrame for the current residue
-        res_mask = (global_atom_df['chain'] == chain) & (global_atom_df['residue'] == resnum)
-        res_df = global_atom_df[res_mask]
-
-        if res_df.empty:
-            # Don't print from worker unless debugging, return None
-            return (residue_info_tuple, None)
-
-        # Call the existing center calculation function
-        center = sample_functional_center(res_df, (resname_letter, resnum), train_mode=False)
-
-        # Return the original identifier tuple and the result (center or None)
-        return (residue_info_tuple, center)
-
-    except Exception as e:
-        print(f"Error processing {residue_info_tuple} in worker: {e}")
-        return (residue_info_tuple, None) # Return None on error
-
-def LINE():
-    return sys._getframe(1).f_lineno
-
+# --- Seeding and Constants ---
+# (Keep Seeding and ELEMENT_MAPPING as before)
 seed = 42
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+ELEMENT_MAPPING = {
+    'C': 0, 'N': 1, 'O': 2, 'F': 3, 'S': 4, 'Cl': 5, 'CL': 5,
+    'P': 6, 'Se': 7, 'SE': 7, 'Fe': 8, 'FE': 8, 'Zn': 9, 'ZN': 9,
+    'Ca': 10, 'CA': 10, 'Mg': 11, 'MG': 11,
+}
+DEFAULT_ELEMENT = 12
 
-_element_mapping = lambda x: {
-    'C': 0,
-    'N': 1,
-    'O': 2,
-    'F': 3,
-    'S': 4,
-    'Cl': 5, 'CL': 5,
-    'P': 6,
-    'Se': 7, 'SE': 7,
-    'Fe': 8, 'FE': 8,
-    'Zn': 9, 'ZN': 9,
-    'Ca': 10, 'CA': 10,
-    'Mg': 11, 'MG': 11,
-}.get(x, 12)
-
+# --- Helper Functions (_normalize, _rbf, _edge_features) ---
+# (Keep these functions as before)
 def _normalize(tensor, dim=-1):
     return torch.nan_to_num(
         torch.div(tensor, torch.norm(tensor, dim=dim, keepdim=True)))
@@ -100,582 +57,727 @@ def _rbf(D, D_min=0., D_max=20., D_count=16, device='cpu'):
 
 def _edge_features(coords, edge_index, D_max=4.5, num_rbf=16, device='cpu'):
     E_vectors = coords[edge_index[0]] - coords[edge_index[1]]
-    rbf = _rbf(E_vectors.norm(dim=-1),
-               D_max=D_max, D_count=num_rbf, device=device)
+    distances = torch.norm(E_vectors, dim=-1)
+    rbf = _rbf(distances, D_max=D_max, D_count=num_rbf, device=device)
     edge_s = rbf
     edge_v = _normalize(E_vectors).unsqueeze(-2)
     edge_s, edge_v = map(torch.nan_to_num, (edge_s, edge_v))
     return edge_s, edge_v
 
+# --- BaseTransform (Used by workers) ---
+# (Keep V2.3 version with as_tensor fix)
 class BaseTransform:
-    '''
-    Transforms atomic coordinates in a DataFrame into a torch_geometric Data graph.
-    Includes CUDA stream support.
-    '''
-    def __init__(self, edge_cutoff=4.5, num_rbf=16, device='cpu', stream=None):
+    """ Creates graph from DataFrame subset """
+    def __init__(self, edge_cutoff=4.5, num_rbf=16, max_neighbors=32, device='cpu'):
         self.edge_cutoff = edge_cutoff
         self.num_rbf = num_rbf
-        self.device = device
-        # Use provided stream or default stream if on GPU, else None for CPU
-        if isinstance(stream, torch.cuda.Stream) and device != 'cpu':
-             self.stream = stream
-        elif device != 'cpu':
-             self.stream = torch.cuda.current_stream()
-        else:
-            self.stream = None # No stream context needed for CPU
+        self.max_neighbors = max_neighbors
+        # Force CPU device for graph creation in workers to avoid CUDA context issues
+        self.device = torch.device('cpu') # Workers should use CPU for graph gen
 
     def __call__(self, df):
-        '''
-        :param df: `pandas.DataFrame` of atomic coordinates.
-        :return: `torch_geometric.data.Data` structure graph.
-        '''
-        # Use stream context only if stream exists
-        context = torch.cuda.stream(self.stream) if self.stream else torch.no_grad()
-        with context:
-             with torch.no_grad():
-                coords = torch.as_tensor(df[['x', 'y', 'z']].to_numpy(),
-                                       dtype=torch.float32, device=self.device)
-                atoms = torch.tensor(df['element'].map(_element_mapping).fillna(0).values,
-                                     dtype=torch.long, device=self.device)
+        """ Creates graph on CPU """
+        protein_id = df['id'].iloc[0] if 'id' in df and not df.empty else 'graph_gen'
+        try:
+            with torch.no_grad():
+                elements_mapped = df['element'].map(ELEMENT_MAPPING)
+                if elements_mapped.isnull().any():
+                    unknown_elements = df['element'][elements_mapped.isnull()].unique()
+                    # print(f"Warning: Unknown elements {unknown_elements} in {protein_id}, mapping to {DEFAULT_ELEMENT}")
+                elements_np = elements_mapped.fillna(DEFAULT_ELEMENT).values
+                elements_np_int64 = elements_np.astype(np.int64)
+                # Create atoms tensor on CPU
+                atoms = torch.as_tensor(elements_np_int64, dtype=torch.long, device=self.device)
 
-                # TODO: Tune radius_graph parameters
-                edge_index = torch_cluster.radius_graph(coords, r=self.edge_cutoff)
+                coords_np = df[['x', 'y', 'z']].to_numpy(dtype=np.float32)
+                 # Create coords tensor on CPU
+                coords = torch.as_tensor(coords_np, dtype=torch.float32, device=self.device)
+
+                edge_index = torch_cluster.radius_graph(coords, r=self.edge_cutoff,
+                                                        max_num_neighbors=self.max_neighbors,
+                                                        batch=None)
+
                 edge_s, edge_v = _edge_features(coords, edge_index, D_max=self.edge_cutoff,
-                                                num_rbf=self.num_rbf, device=self.device)
+                                                num_rbf=self.num_rbf, device=self.device) # Features also on CPU
+
                 data = Data(x=coords, atoms=atoms,
                             edge_index=edge_index, edge_s=edge_s, edge_v=edge_v)
-
-                if 'same_chain' in df.columns:
-                    data.chain_ind = torch.tensor(df['same_chain'].values, dtype=torch.long, device=self.device)
-
+                # Store protein_id within the data object for easy retrieval after batching
+                data.protein_id = protein_id
                 return data
+        except Exception as e:
+            print(f"Error during BaseTransform for {protein_id}: {e}")
+            return None
 
-# --- Helper Functions ---
-def sample_functional_center(df, resid_tuple, train_mode=False):
-    """
-    Calculates the center of a residue based on its functional atoms.
-
-    Parameters:
-     - df: pandas.DataFrame containing atoms ONLY for the target residue.
-     - resid_tuple: Tuple (resname_letter, resnum), e.g., ('A', 123).
-     - train_mode: Boolean, if True selects one random atom, if False uses all.
-
-    Returns:
-     - np.array: Coordinates of the calculated center (shape [3,]).
-     - None: If no suitable center atoms found or df is empty.
-    """
-    if df.empty:
-        print(f"Warning: DataFrame provided to sample_functional_center is empty for {resid_tuple}. Returning None.")
-        return None
-
-    resname, resnum = resid_tuple
-    func_atoms_options = atom_info.abbr_key_atom_dict.get(resname, [])
-
+# --- sample_functional_center ---
+# (Keep V2.3 version)
+def sample_functional_center(res_df, resid_tuple, train_mode=False):
+    if res_df.empty: return None
+    resname_letter, resnum = resid_tuple
+    func_atoms_options = atom_info.abbr_key_atom_dict.get(resname_letter, [])
     func_atoms = []
-    if not func_atoms_options:
-        func_atoms = ['CA']
-    elif train_mode:
-        # Training mode: select one random atom from all functional groups
-        all_func_atoms = [atom for sublist in func_atoms_options for atom in sublist]
-        if not all_func_atoms:
-            func_atoms = ['CA']
-        else:
-            chosen_atom = np.random.choice(all_func_atoms)
-            func_atoms = [chosen_atom]
-    else:
-        # Inference mode: use all defined functional atoms
+    if not func_atoms_options: func_atoms = ['CA']
+    elif not train_mode:
         func_atoms = [atom for sublist in func_atoms_options for atom in sublist]
-        if not func_atoms:
-            func_atoms = ['CA']
-
-    coords_all = df[['x', 'y', 'z']].to_numpy(dtype=np.float32)
-    names = df['name'].to_numpy()
-    # Create mapping {atom_name: coordinate_array} for atoms present in this residue
-    name_to_coord = {name: coord for name, coord in zip(names, coords_all)}
-    func_coords = [name_to_coord[name] for name in func_atoms if name in name_to_coord]
-
-    # If no specified functional atoms were found in the df, try falling back to CA
-    if not func_coords and 'CA' in name_to_coord:
-        # Ensure 'CA' wasn't already the only option in func_atoms list
-        if 'CA' not in func_atoms:
-            print(f"Warning: Defined functional atoms {func_atoms} not found for residue {resname}{resnum}. Using CA instead.")
-        func_coords = [name_to_coord['CA']]
-    elif not func_coords:
-        # If absolutely no functional atoms or CA found (e.g., incomplete residue in PDB)
-        # Get the 3-letter code just for a more informative message, if possible
-        three_letter_code_for_msg = df['resname'].iloc[0] if 'resname' in df.columns and not df.empty else resname
-        print(f"Warning: No suitable center atoms (functional: {func_atoms} or CA) found for residue {three_letter_code_for_msg} {resnum}. Cannot calculate center.")
+        if not func_atoms: func_atoms = ['CA']
+    else: # train_mode=True
+        all_func_atoms = [atom for sublist in func_atoms_options for atom in sublist]
+        if not all_func_atoms: func_atoms = ['CA']
+        else: func_atoms = [np.random.choice(all_func_atoms)]
+    try:
+        coords_all = res_df[['x', 'y', 'z']].to_numpy(dtype=np.float32)
+        names = res_df['name'].to_numpy()
+        name_to_coord = {name: coord for name, coord in zip(names, coords_all)}
+        func_coords = [name_to_coord[name] for name in func_atoms if name in name_to_coord]
+        if not func_coords and 'CA' in name_to_coord:
+            func_coords = [name_to_coord['CA']]
+        elif not func_coords:
+            return None
+        center = np.mean(func_coords, axis=0, dtype=np.float32)
+        return center
+    except Exception as e:
+        print(f"Error in sample_functional_center for {resname_letter}{resnum}: {e}")
         return None
 
-    center = np.mean(func_coords, axis=0, dtype=np.float32)
+# --- extract_env_for_residue (Helper for worker transform) ---
+# Renamed from extract_env_from_resid, simplified
+def extract_env_for_residue(chain_atoms_df, resid_tuple, env_radius, base_transform):
+    """ Creates graph for one residue env using BaseTransform. Runs on CPU."""
+    resname_letter, resnum = resid_tuple
+    protein_id = chain_atoms_df['id'].iloc[0] if 'id' in chain_atoms_df else 'unknown_chain'
 
-    return center
+    res_mask = (chain_atoms_df['residue'] == resnum)
+    res_df = chain_atoms_df.loc[res_mask]
+    if res_df.empty: return None
 
-
-# --- New Vectorized Environment Extraction ---
-def batch_extract_env(atom_df, unique_residues, env_radius, device, transforms):
-    """
-    Vectorized extraction of residue environments using torch.cdist and CUDA streams.
-
-    Parameters:
-     - atom_df: pandas.DataFrame with all atoms for the protein.
-     - unique_residues: List/array of tuples like (chain, resnum, resname_letter).
-     - env_radius: Float, radius for neighbor search.
-     - device: Torch device.
-     - transforms: List of BaseTransform instances (one per stream).
-
-    Returns:
-     - graphs: List of torch_geometric.data.Data objects.
-     - valid_residues: List of (chain, resnum, resname_letter) tuples corresponding to successful graphs.
-    """
-    centers = []
-    valid_res_info = [] # Store (chain, resnum, resname_letter) for mapping later
-    res_dfs = {} # Cache res_df for center calculation
-
-    all_coords_np = atom_df[['x', 'y', 'z']].values.astype(np.float32)
-
-    # 1. Calculate centers sequentially (potential future optimization point)
-    for chain, resnum, resname_letter in unique_residues:
-        if resname_letter == 'X':
-             continue
-        # Filter atom_df *correctly* for the current residue
-        res_mask = (atom_df['chain'] == chain) & (atom_df['residue'] == resnum)
-        res_df = atom_df[res_mask]
-
-        if res_df.empty:
-            print(f"Warning: No atoms found for {chain}-{resname_letter}{resnum}. Skipping.")
-            continue
-
-        center = sample_functional_center(res_df, (resname_letter, resnum), train_mode=False)
-
-        if center is not None:
-            centers.append(center)
-            valid_res_info.append((chain, resnum, resname_letter))
-        else:
-            print(f"Failed to get center for {chain}-{resname_letter}{resnum}. Skipping.")
-
-
-    if not centers:
-        print("No valid residue centers found for this protein.")
-        return [], []
-
-    # 2. Batch distance calculation
-    all_coords_gpu = torch.tensor(all_coords_np, dtype=torch.float32, device=device)
-    centers_gpu = torch.tensor(np.array(centers), dtype=torch.float32, device=device) # Shape: (M, 3)
-
-    # Compute all pairwise distances: (N_atoms, M_centers)
-    dists = torch.cdist(all_coords_gpu, centers_gpu)
-    neighbor_masks = dists < env_radius 
-
-    # 3. Batch graph generation (using streams)
-    graphs = []
-    final_valid_residues = [] # Residues for which graph generation succeeded
-    num_transforms = len(transforms)
-
-    for i in range(centers_gpu.shape[0]): # Iterate through centers (M)
-        center_index = i
-        # Find indices of atoms neighboring this center
-        neighbor_atom_indices_gpu = torch.where(neighbor_masks[:, center_index])[0]
-
-        if neighbor_atom_indices_gpu.numel() == 0:
-            res_info = valid_res_info[center_index]
-            print(f'No environment atoms found for {res_info[0]}-{res_info[2]}{res_info[1]} within {env_radius}A. Skipping.')
-            continue
-
-        # Select the corresponding transform instance using round-robin
-        current_transform = transforms[center_index % num_transforms]
-
-        # Get CPU indices to slice the original DataFrame
-        neighbor_atom_indices_cpu = neighbor_atom_indices_gpu.cpu().numpy()
-        df_env = atom_df.iloc[neighbor_atom_indices_cpu].reset_index(drop=True) # Create env DataFrame
-
-        # Create graph using the selected transform (and its associated stream)
-        # The transform.__call__ method uses its assigned stream context internally
-        try:
-            graph = current_transform(df_env)
-            if graph is not None:
-                 graphs.append(graph)
-                 final_valid_residues.append(valid_res_info[center_index]) # Add corresponding residue info
-            else:
-                 res_info = valid_res_info[center_index]
-                 print(f"Transform returned None for {res_info[0]}-{res_info[2]}{res_info[1]}. Skipping.")
-
-        except Exception as e:
-            res_info = valid_res_info[center_index]
-            print(f"Error creating graph for {res_info[0]}-{res_info[2]}{res_info[1]}: {e}. Skipping.")
-            continue
-
-
-    # Ensure all streams are synchronized
-    if device != 'cpu':
-        for stream in [t.stream for t in transforms if t.stream is not None]:
-             stream.synchronize()
-
-    return graphs, final_valid_residues
-
-def opt_embed_protein(atom_df, model, device, include_hets, env_radius, transforms):
-    """
-    Optimized protein embedding using vectorized environment extraction and batch inference.
-
-    Parameters:
-    - atom_df: Filtered DataFrame for the protein.
-    - model: Pre-trained COLLAPSE model.
-    - device: Torch device.
-    - include_hets: Boolean, whether to include HETATMs.
-    - env_radius: Float, radius for environments.
-    - transforms: List of BaseTransform instances for stream parallelism.
-
-    Returns:
-    - emb_data: Dictionary containing 'embeddings', 'resids', 'chains', 'confidence', or None.
-    """
-    emb_data = col.defaultdict(list)
-
-    chains = atom_df['chain'].values
-    residues = atom_df['residue'].values
-    resnames = atom_df['resname'].values
-    bfactors = atom_df['bfactor'].values
-
-    resname_letters = [atom_info.aa_to_letter(r) for r in resnames]
-
-    residue_info = pd.DataFrame({
-        'chain': chains,
-        'residue': residues,
-        'resname_letter': resname_letters,
-        'bfactor': bfactors
-    })
-
-    if not include_hets:
-        residue_info = residue_info[atom_df['resname'].isin(atom_info.aa)]
-
-    unique_res_df = residue_info[['chain', 'residue', 'resname_letter', 'bfactor']].drop_duplicates(subset=['chain', 'residue'])
-    unique_residues_list = [tuple(row) for row in unique_res_df[['chain', 'residue', 'resname_letter']].values]
-    res_to_bfactor = dict(zip(zip(unique_res_df['chain'], unique_res_df['residue']), unique_res_df['bfactor']))
-
-    graphs, valid_residues = batch_extract_env(atom_df, unique_residues_list, env_radius, device, transforms)
-
-    if not graphs:
-        protein_id = atom_df.get('id', 'unknown')
-        print(f"No graphs generated for protein {protein_id}. Skipping embedding.")
-        return None
-
-    for chain, resnum, resname_letter in valid_residues:
-        resid = f"{resname_letter}{resnum}"
-        emb_data['resids'].append(resid)
-        bfactor = res_to_bfactor.get((chain, resnum), 0.0)
-        emb_data['confidence'].append(bfactor)
-
-    def get_protein_id(df):
-        return df['id'].iloc[0] if not df.empty and 'id' in df else 'unknown_protein_id'
-
-    embeddings_list = []
-    batch_size = 128 # Or 64, 256, etc.
-    num_graphs = len(graphs)
-
-    def get_protein_id(df):
-        return df['id'].iloc[0] if not df.empty and 'id' in df else 'unknown_protein_id'
-
-    with torch.no_grad():
-        for i in range(0, num_graphs, batch_size):
-            graph_chunk = graphs[i : i + batch_size]
-            if not graph_chunk: continue
-
-            graphs_batch_chunk = Batch.from_data_list(graph_chunk).to(device)
-
-            try:
-                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == 'cuda')):
-                    embs_chunk, _ = model.online_encoder(graphs_batch_chunk, return_projection=False)
-                    embs_chunk = embs_chunk.float()
-                embeddings_list.append(embs_chunk.cpu())
-
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    protein_id_str = get_protein_id(atom_df)
-                    print(f"⚠️ OOM on protein {protein_id_str} even during mini-batching (batch size {batch_size}, chunk starting at {i}). Attempting fallback.")
-                    torch.cuda.empty_cache()
-                    pooled_emb_np = pool_resid_embed(atom_df, valid_residues, model,
-                                                     device=device, include_hets=include_hets,
-                                                     env_radius=env_radius)
-
-                    if pooled_emb_np is None:
-                        print(f"❌ Fallback embedding also failed for {protein_id_str}")
-                        return None 
-                    else:
-                        print(f"❌ Fallback provides protein-level embedding. Cannot return per-residue for {protein_id_str} due to mini-batch OOM.")
-                        return None 
-
-                else:
-                    raise e
-
-            # Clear cache more frequently if memory is extremely tight
-            # torch.cuda.empty_cache()
-    if not embeddings_list:
-        protein_id_str = get_protein_id(atom_df)
-        print(f"Warning: No embeddings generated after mini-batching for {protein_id_str}. Returning None.")
-        return None # Essential check: if no embeddings, return None
-
-    if not embeddings_list:
-        print(f"Warning: No embeddings generated after mini-batching for {get_protein_id(atom_df)}.")
-        return None
-
-    final_embs = torch.cat(embeddings_list, dim=0)
-    # ---- END MINI-BATCHING ----
-
-    if isinstance(final_embs, torch.Tensor):
-        emb_data['embeddings'] = final_embs.numpy()
-    else:
-        print(f"Warning: Final embeddings are not a tensor ({type(final_embs)}). Setting to None.")
-        emb_data['embeddings'] = None
-        return None
-
-    if len(emb_data['embeddings']) != len(emb_data['resids']):
-        protein_id_str_warn = get_protein_id(atom_df)
-        print(f"Warning: Mismatch between final number of embeddings ({len(emb_data['embeddings'])}) and residues ({len(emb_data['resids'])}) for protein {protein_id_str_warn}.")
-        return None
-
-    return emb_data
-
-def pool_resid_embed(atom_df, residue_list, model, device='cuda', include_hets=True, env_radius=10.0):
-    """
-    Fallback: Embeds residues sequentially using embed_residue and pools them.
-
-    Parameters:
-     - atom_df (pd.DataFrame): DataFrame with all protein atoms.
-     - residue_list (List[Tuple[str, int, str]]): List of (chain, resnum, resname_letter) tuples
-                                                  for residues that need embedding.
-     - model (nn.Module): The embedding model.
-     - device (str or torch.device): Device for computation.
-     - include_hets (bool): Flag passed to embed_residue.
-     - env_radius (float): Radius passed to embed_residue.
-
-    Returns:
-     - np.ndarray: Pooled protein-level embedding, or None if all residues fail.
-    """
-    residue_embs_list = []
-
-    if 'embed_residue' not in globals():
-         print("Error: Fallback function `embed_residue` is not defined or imported.")
-         return None
-
-    for chain, resnum, resname_letter in residue_list: 
-        try:
-
-            resid_str = f"{resname_letter}{resnum}"
-            chain_resid_formatted = (chain, resid_str)
-
-            emb_np = embed_residue(atom_df=atom_df,
-                                   chain_resid=chain_resid_formatted,
-                                   model=model,
-                                   device=device,
-                                   include_hets=include_hets,
-                                   env_radius=env_radius)
-
-            if emb_np is not None:
-                if np.isfinite(emb_np).all():
-                    residue_embs_list.append(emb_np)
-                else:
-                    protein_id_str = atom_df['id'].iloc[0] if not atom_df.empty and 'id' in atom_df else 'unknown'
-                    print(f"⚠️ Fallback embed_residue for {protein_id_str} {chain_resid_formatted} resulted in non-finite values. Skipping.")
-
-        except Exception as e:
-            protein_id_str = atom_df['id'].iloc[0] if not atom_df.empty and 'id' in atom_df else 'unknown'
-            print(f"⚠️ Fallback failed for {protein_id_str} attempting to embed residue with chain_resid={chain_resid_formatted}: {e}")
-            # Print traceback for debugging
-            # import traceback
-            # traceback.print_exc()
-            continue
-
-    if not residue_embs_list:
-        print("❌ Fallback: No residues successfully embedded.")
-        return None
+    center = sample_functional_center(res_df, resid_tuple, train_mode=False)
+    if center is None: return None
 
     try:
-        out_all = torch.tensor(np.stack(residue_embs_list), dtype=torch.float32, device=device)
-    except ValueError as e:
-        print(f"❌ Fallback: Error stacking residue embeddings. Check for shape consistency. {e}")
+        # Neighbor search on CPU using NumPy/SciPy or simple loops if torch_cluster CPU is slow/unavailable
+        # Option 1: Basic NumPy loop (might be slow for large chains)
+        coords_chain_np = chain_atoms_df[['x', 'y', 'z']].to_numpy(dtype=np.float32)
+        dists_sq = np.sum((coords_chain_np - center)**2, axis=1)
+        neighbor_mask = dists_sq < (env_radius**2)
+        pt_idx_cpu = np.where(neighbor_mask)[0]
+
+        # # Option 2: If you have scipy installed (often faster)
+        # from scipy.spatial import KDTree
+        # coords_chain_np = chain_atoms_df[['x', 'y', 'z']].to_numpy(dtype=np.float32)
+        # tree = KDTree(coords_chain_np)
+        # pt_idx_cpu = tree.query_ball_point(center, r=env_radius)
+        # if not pt_idx_cpu: return None # Convert list to numpy array if needed later
+
+        if len(pt_idx_cpu) == 0: return None
+
+        # Slice to get environment df
+        df_env = chain_atoms_df.iloc[pt_idx_cpu].reset_index(drop=True)
+        df_env['id'] = protein_id # Add protein ID for context
+
+        # Create graph using BaseTransform (will be on CPU)
+        graph = base_transform(df_env)
+        # Add residue info to the graph object itself before returning
+        if graph is not None:
+             graph.resid = f"{resname_letter}{resnum}"
+             graph.chain = chain_atoms_df['chain'].iloc[0] # Get chain from chain_df
+             graph.resname_letter = resname_letter
+             graph.resnum = resnum
+        return graph
+
+    except Exception as e:
+        print(f"Error extracting environment (CPU) for {resname_letter}{resnum} in {protein_id}: {e}")
         return None
 
-    batch_id = torch.zeros(out_all.size(0), dtype=torch.long, device=out_all.device)
+# --- prepare_graphs_for_protein (Worker Task Helper) ---
+def prepare_graphs_for_protein(atom_df, include_hets, env_radius, base_transform):
+    """ Prepares list of graphs and metadata for a single protein (CPU Task) """
+    # This function runs within the DataLoader worker process
 
-    protein_emb = None
+    graphs = []
+    metadata = [] # Store metadata corresponding to each graph generated
+
+    protein_id_str = atom_df['id'].iloc[0] if 'id' in atom_df else 'unknown_prep'
+
+    # --- Prepare unique residues ---
+    required_cols = ['chain', 'residue', 'resname', 'bfactor', 'element', 'x', 'y', 'z', 'name']
+    if not all(col in atom_df.columns for col in required_cols):
+        # print(f"Error: Missing required columns in DataFrame for {protein_id_str}")
+        return [], [] # Return empty lists
+
+    try:
+        if not (hasattr(atom_info, 'aa_to_letter') and callable(atom_info.aa_to_letter)):
+             raise AttributeError("atom_info.aa_to_letter lambda function not found or not callable")
+        resname_letters = atom_df['resname'].apply(atom_info.aa_to_letter).to_list()
+        atom_df['resname_letter'] = resname_letters
+    except Exception as e:
+         print(f"Error mapping resnames for {protein_id_str} in worker: {e}")
+         return [], [] # Return empty lists
+
+    residue_info_df = atom_df[['chain', 'residue', 'resname_letter', 'bfactor']].drop_duplicates(subset=['chain', 'residue'])
+    standard_letters = set(atom_info.aa_abbr) - {'X'}
+    standard_aa_mask = residue_info_df['resname_letter'].isin(standard_letters)
+    residue_info_df = residue_info_df[standard_aa_mask]
+
+    if not include_hets:
+        pass
+
+    if residue_info_df.empty:
+         return [], []
+
+    res_to_bfactor = dict(zip(zip(residue_info_df['chain'], residue_info_df['residue']), residue_info_df['bfactor']))
+
+    grouped_by_chain = atom_df.groupby('chain')
+
+    for chain_id, chain_atoms_df in grouped_by_chain:
+        unique_residues_this_chain = residue_info_df[residue_info_df['chain'] == chain_id][['resname_letter', 'residue']].values
+        if len(unique_residues_this_chain) == 0: continue
+
+        for resname_letter, resnum in unique_residues_this_chain:
+            try:
+                resnum_int = int(resnum)
+            except ValueError: continue # Skip if resnum isn't int
+            resid_tuple = (resname_letter, resnum_int)
+
+            # Pass the single transform instance created for this worker
+            graph = extract_env_for_residue(chain_atoms_df, resid_tuple, env_radius, base_transform)
+
+            if graph is not None:
+                graphs.append(graph)
+                # Get metadata associated with this graph
+                bfactor = res_to_bfactor.get((chain_id, resnum_int), 0.0)
+                metadata.append({
+                    'protein_id': protein_id_str, # Changed from graph.protein_id
+                    'chain': chain_id,
+                    'resid': graph.resid, # Get info attached in extract_env
+                    'confidence': bfactor
+                })
+
+    return graphs, metadata # Return list of graphs and list of metadata dicts
+
+# --- Graph Preparation Transform (for DataLoader Workers) ---
+class GraphPreparationTransform:
+    """ Performs CPU-heavy preprocessing and graph creation in workers """
+    def __init__(self, include_hets=True, env_radius=10.0, max_neighbors=32):
+        self.include_hets = include_hets
+        self.env_radius = env_radius
+        # Create a BaseTransform instance FOR EACH WORKER when initialized
+        # Important: Graph creation must happen on CPU within worker
+        self.base_transform = BaseTransform(edge_cutoff=self.env_radius,
+                                            num_rbf=16,
+                                            max_neighbors=max_neighbors,
+                                            device='cpu') # Ensure CPU
+
+    def __call__(self, elem):
+        """ Processes one raw element from the dataset """
+        atom_df_raw = elem.get('atoms')
+        protein_id = elem.get('id', 'unknown')
+
+        if atom_df_raw is None:
+             print(f"Warning: Worker received item with no 'atoms' key for {protein_id}")
+             return None # Indicate failure
+
+        try:
+            # Preprocessing
+            atom_df = first_model_filter(atom_df_raw)
+            atom_df = atom_df[~atom_df.hetero.str.contains('W')]
+            atom_df = atom_df[atom_df.element != 'H']
+            if not self.include_hets:
+                if hasattr(atom_info, 'aa'):
+                     if 'resname' in atom_df.columns:
+                         atom_df = atom_df[atom_df.resname.isin(atom_info.aa)]
+                     else: return None # Cannot filter
+                else: pass # atom_info missing 'aa'
+
+            atom_df = atom_df.reset_index(drop=True)
+            if atom_df.empty: return None
+            atom_df['id'] = protein_id # Add ID back for prepare_graphs function
+            if not {'resname', 'chain', 'residue', 'element', 'x', 'y', 'z', 'name', 'bfactor'}.issubset(atom_df.columns):
+                 return None
+
+        except Exception as e:
+            print(f"Worker skipping {protein_id} due to preprocessing error: {e}")
+            return None # Indicate failure
+
+        # Call the graph preparation function
+        try:
+            graphs, metadata = prepare_graphs_for_protein(atom_df,
+                                                        self.include_hets,
+                                                        self.env_radius,
+                                                        self.base_transform)
+            if not graphs: # If prepare_graphs returned empty list
+                return None
+            return {'graphs': graphs, 'metadata': metadata}
+
+        except Exception as e:
+             print(f"Worker error during graph preparation for {protein_id}: {e}")
+             # import traceback; traceback.print_exc() # Makes logs verbose
+             return None # Indicate failure
+
+
+# --- Custom Collate Function (More Robust)---
+def graph_collate_fn(batch):
+    """ Collates outputs from workers into a single large graph batch and metadata list """
+    valid_items = []
+    # Filter out None results and ensure items are dictionaries with required keys
+    for idx, item in enumerate(batch):
+        # Check if item is a dictionary and has the keys we need
+        if isinstance(item, dict) and 'graphs' in item and 'metadata' in item:
+            # Optionally, only include items that actually produced graphs
+            if item['graphs']: # Check if the graphs list is not empty
+                valid_items.append(item)
+            # else: # Optional logging if needed
+            #    print(f"Debug: Worker returned item with empty graphs list (Index {idx}).")
+        elif item is not None:
+            # Log unexpected non-None items that aren't the correct dict structure
+            print(f"Warning: Collate received unexpected item type: {type(item)} at index {idx}. Value: {str(item)[:100]}...") # Print type and truncated value
+
+    # If the batch is empty after filtering valid items
+    if not valid_items:
+        # print("Debug: Collate function resulted in an empty batch.") # Optional logging
+        return None, None # Return None if batch is empty
+
+    all_graphs = []
+    all_metadata = []
+
+    # Iterate through the validated items
+    for item in valid_items:
+        all_graphs.extend(item['graphs'])
+        all_metadata.extend(item['metadata']) # Keep metadata as a flat list of dicts
+
+    # Double-check if all_graphs is empty - shouldn't happen if valid_items check passed
+    if not all_graphs:
+        print("Warning: No graphs collected in collate function despite valid items.")
+        return None, None
+
+    try:
+        # Create the single large batch for the GPU
+        final_graph_batch = Batch.from_data_list(all_graphs)
+        return final_graph_batch, all_metadata
+    except Exception as e:
+        # Catch errors during Batch.from_data_list, which can be sensitive
+        print(f"Error during Batch.from_data_list: {e}")
+        # Try to identify which proteins might have caused the issue
+        problematic_ids = list(set(m.get('protein_id', 'Unknown') for m in all_metadata))
+        print(f"Potentially problematic IDs in batch leading to collation error: {problematic_ids}")
+        # import traceback; traceback.print_exc() # Uncomment for deeper debug
+        return None, None # Indicate failure
+
+
+# --- Dataset Wrapper ---
+class Atom3DDatasetWrapper(Dataset):
+    """ Wraps an existing atom3d dataset """
+    def __init__(self, atom3d_dataset, transform=None):
+        self.dataset = atom3d_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        # Return the raw item, transform will be applied by DataLoader worker
+        try:
+            item = self.dataset[idx]
+            if self.transform is not None:
+                item = self.transform(item)
+            return item
+        except Exception as e:
+            print(f"Error loading item {idx} from base dataset: {e}")
+            return None # Return None to be filtered by collate_fn
+
+# --- is_valid_pdb ---
+# (Keep as before)
+def is_valid_pdb(filepath):
+    try: return os.path.getsize(filepath) > 0
+    except OSError: return False
+
+def get_gpu_memory_info():
+    """Get GPU memory information in human readable format"""
+    if torch.cuda.is_available():
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        allocated = torch.cuda.memory_allocated(0)
+        cached = torch.cuda.memory_reserved(0)
+        free = total_memory - allocated
+        
+        def bytes_to_gb(bytes):
+            return bytes / (1024**3)
+            
+        return {
+            'total': f"{bytes_to_gb(total_memory):.2f}GB",
+            'allocated': f"{bytes_to_gb(allocated):.2f}GB",
+            'cached': f"{bytes_to_gb(cached):.2f}GB",
+            'free': f"{bytes_to_gb(free):.2f}GB"
+        }
+    return None
+
+def get_batch_memory_usage(graph_batch):
+    """Get memory usage of a batch in human readable format"""
+    if graph_batch is None:
+        return "0B"
+    
+    def get_tensor_memory(tensor):
+        if tensor is None:
+            return 0
+        return tensor.element_size() * tensor.nelement()
+    
+    total_memory = 0
+    for key, value in graph_batch:
+        if isinstance(value, torch.Tensor):
+            total_memory += get_tensor_memory(value)
+    
+    # Convert to human readable format
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if total_memory < 1024:
+            return f"{total_memory:.2f}{unit}"
+        total_memory /= 1024
+    return f"{total_memory:.2f}TB"
+
+def embed_residue_batch(graph_batch, model, device='cpu'):
+    """Process a batch of residue graphs and return their embeddings"""
+    if not isinstance(graph_batch, Batch) or len(graph_batch) == 0:
+        return None
+        
+    graph_batch = graph_batch.to(device)
     with torch.no_grad():
-        if getattr(model, "scatter_mean", False):
-            protein_emb = torch_scatter.scatter_mean(out_all, batch_id, dim=0)
-        elif getattr(model, "attn", False) and hasattr(model, "global_attn"):
-             protein_emb = torch.tanh(model.global_attn(out_all, batch_id))
-        else:
-             print("Warning: Model type for pooling (scatter_mean or attn) not specified in fallback. Using simple mean.")
-             protein_emb = torch.mean(out_all, dim=0, keepdim=True)
+        with torch.autocast(device_type=str(device.type), dtype=torch.float16, enabled=(str(device.type) == 'cuda')):
+            embs, _ = model.online_encoder(graph_batch, return_projection=False)
+            return embs.float().cpu().numpy()
 
-    if protein_emb is None:
-        return None
+def find_optimal_chunk_size(graphs, model, device, start_size=100):
+    """Binary search to find largest number of residues that fit in GPU memory"""
+    left, right = 1, start_size
+    max_size = 1
+    
+    while left <= right:
+        mid = (left + right) // 2
+        try:
+            # Clear cache before test
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Try processing mid number of graphs
+            test_batch = Batch.from_data_list(graphs[:mid]).to(device)
+            test_embs = embed_residue_batch(test_batch, model, device)
+            
+            if test_embs is not None:
+                max_size = mid
+                left = mid + 1
+            else:
+                right = mid - 1
+                
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                right = mid - 1
+            else:
+                raise e
+            
+    return max_size
 
-    if isinstance(protein_emb, torch.Tensor):
-        return protein_emb.squeeze().cpu().numpy()
-    else:
-        print("Warning: Pooled embedding is not a tensor.")
-        return None
-
-# --- Modified OptEmbedTransform ---
-class OptEmbedTransform(object):
-    """
-    A transform that applies the optimized embedding procedure to each dataset entry.
-    Manages CUDA streams and multiple BaseTransform instances internally.
-    """
-    def __init__(self, model, include_hets=True, env_radius=10.0, device='cuda', num_streams=4):
+class OptEmbedTransform:
+    """Optimized transform that processes residues in optimal-sized chunks.
+    This transform is specifically for use by annotate_pdb.py and similar single-protein processing tasks."""
+    def __init__(self, model, include_hets=True, env_radius=10.0, device='cpu'):
         self.model = model
         self.include_hets = include_hets
         self.env_radius = env_radius
         self.device = device
-        self.num_streams = num_streams if device != 'cpu' else 1
-
-        # Initialize streams and transforms only if using CUDA
-        if self.device != 'cpu':
-            self.streams = [torch.cuda.Stream(device=self.device) for _ in range(self.num_streams)]
-            self.transforms = [BaseTransform(edge_cutoff=self.env_radius, 
-                                             num_rbf=16,
-                                             device=self.device,
-                                             stream=s) for s in self.streams]
-        else:
-            self.streams = [None]
-            self.transforms = [BaseTransform(edge_cutoff=self.env_radius, num_rbf=16, device=self.device, stream=None)]
-
-
+        # Create transform instances
+        self.graph_transform = GraphPreparationTransform(
+            include_hets=include_hets,
+            env_radius=env_radius
+        )
+        
     def __call__(self, elem):
-        atom_df_raw = elem['atoms']
-        protein_id = elem.get('id', 'unknown')
-
+        """Process one protein and return embeddings"""
+        # First use the graph preparation transform to get graphs and metadata
+        result = self.graph_transform(elem)
+        if result is None:
+            return None
+            
+        graphs, metadata = result['graphs'], result['metadata']
+        if not graphs:
+            return None
+            
         try:
-            atom_df = first_model_filter(atom_df_raw)
-            atom_df = atom_df[~atom_df.hetero.str.contains('W')] # Remove water
-            atom_df = atom_df[atom_df.element != 'H'].reset_index(drop=True) # Remove hydrogens
-            if not self.include_hets:
-                atom_df = atom_df[atom_df.resname.isin(atom_info.aa)].reset_index(drop=True)
-
-            if atom_df.empty:
-                 print(f"Skipping {protein_id}: No atoms left after filtering.")
-                 return None
-
-            atom_df['id'] = protein_id
-
-            if 'resname' not in atom_df.columns:
-                 print(f"Error: 'resname' column missing in DataFrame for {protein_id}. Cannot proceed.")
-                 return None
-
-
+            # Find optimal chunk size for these graphs
+            chunk_size = find_optimal_chunk_size(graphs, self.model, self.device)
+            
+            # Process in chunks
+            all_embeddings = []
+            for i in range(0, len(graphs), chunk_size):
+                chunk = graphs[i:i + chunk_size]
+                chunk_batch = Batch.from_data_list(chunk)
+                chunk_embs = embed_residue_batch(chunk_batch, self.model, self.device)
+                
+                if chunk_embs is not None:
+                    all_embeddings.extend(chunk_embs)
+                else:
+                    print(f"Warning: Failed to get embeddings for chunk {i//chunk_size}")
+                    return None
+                    
+            if not all_embeddings:
+                return None
+                
+            # Prepare output in the same format as before for compatibility with annotate_pdb.py
+            embeddings = np.stack(all_embeddings, axis=0)
+            return {
+                'id': elem.get('id', 'unknown'),
+                'embeddings': embeddings,
+                'resids': [m['resid'] for m in metadata],
+                'chains': [m['chain'] for m in metadata],
+                'confidence': [m['confidence'] for m in metadata]
+            }
+            
         except Exception as e:
-            print(f"Skipping {protein_id} due to preprocessing error: {e}")
+            print(f"Error in OptEmbedTransform: {e}")
             return None
 
-        outdata = opt_embed_protein(atom_df, self.model, device=self.device,
-                                      include_hets=self.include_hets,
-                                      env_radius=self.env_radius,
-                                      transforms=self.transforms)
-
-        if outdata is None:
-            print(f"Embedding failed for {protein_id}.")
-            return None
-
-        # Update the original element dictionary
-        elem['resids'] = outdata['resids']
-        elem['confidence'] = outdata['confidence']
-        elem['chains'] = outdata['chains']
-        elem['embeddings'] = outdata['embeddings']
-
-        return elem
-
-def is_valid_pdb(filepath):
-    """Check if the file is non-empty before processing."""
-    try:
-        return os.path.getsize(filepath) > 0
-    except OSError:
-        return False
-
+# --- main function (V2.4 - DataLoader Parallelism) --- ## MODIFIED ##
 def main():
-    parser = argparse.ArgumentParser(description="Optimized embedding generation using vectorization and streams")
-    parser.add_argument('data_dir', type=str, help="Directory containing PDB/mmCIF files or LMDB dataset")
-    parser.add_argument('out_dir', type=str, help="Output directory for LMDB dataset")
-    parser.add_argument('--split_id', type=int, default=0, help="Split ID (1 to num_splits) for processing subset")
-    parser.add_argument('--checkpoint', type=str, default='data/checkpoints/collapse_base.pt', help="Path to model checkpoint")
-    parser.add_argument('--filetype', type=str, default='pdb', help="Input file type (e.g., pdb, cif, pdb.gz, lmdb)")
-    parser.add_argument('--num_splits', type=int, default=1, help="Number of splits to divide the dataset into")
-    parser.add_argument('--num_streams', type=int, default=4, help="Number of CUDA streams for parallel graph construction")
-    parser.add_argument('--env_radius', type=float, default=10.0, help="Radius for local environment extraction")
-    parser.add_argument('--include_hets', action='store_true', help="Include HETATMs in processing")
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode for detailed output on first few entries')
+    parser = argparse.ArgumentParser(description="V2.4 Embedding generation with DataLoader Parallelism")
+    parser.add_argument('data_dir', type=str)
+    parser.add_argument('out_dir', type=str)
+    parser.add_argument('--split_id', type=int, default=0)
+    parser.add_argument('--checkpoint', type=str, default='data/checkpoints/collapse_base.pt')
+    parser.add_argument('--filetype', type=str, default='pdb')
+    parser.add_argument('--num_splits', type=int, default=1)
+    parser.add_argument('--env_radius', type=float, default=10.0)
+    parser.add_argument('--include_hets', action='store_true', default=False)
+    parser.add_argument('--max_neighbors', type=int, default=32, help="Max neighbors for radius graph (default 32)")
+    parser.add_argument('--compile_model', action='store_true', help="Enable torch.compile (PyTorch 2.0+)")
+    parser.add_argument('--num_workers', type=int, default=4, help="Number of DataLoader workers for parallel processing")
+    parser.add_argument('--batch_size', type=int, default=1, help="Number of *proteins* per batch for DataLoader")  # Reduced default batch size
+    parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    
+    # Print initial GPU memory info
+    gpu_info = get_gpu_memory_info()
+    if gpu_info:
+        print("\nInitial GPU Memory Information:")
+        for key, value in gpu_info.items():
+            print(f"{key}: {value}")
+    
+    print(f"Using num_workers: {args.num_workers}, batch_size: {args.batch_size}")
 
+    print("Loading model...")
     model = initialize_model(args.checkpoint, device=device)
     model.eval()
 
-    opt_transform = OptEmbedTransform(model,
-                                    include_hets=args.include_hets,
-                                    env_radius=args.env_radius,
-                                    device=device,
-                                    num_streams=args.num_streams)
+    if args.compile_model and hasattr(torch, 'compile'):
+        print("Compiling model...")
+        try:
+            model = torch.compile(model, mode="default")
+            print("Model compiled successfully.")
+        except Exception as e:
+            print(f"Warning: Model compilation failed: {e}")
 
-    print(f"Loading dataset from: {args.data_dir} with filetype: {args.filetype}")
-    dataset = load_dataset(args.data_dir, args.filetype, transform=opt_transform)
-
-    print(f"Dataset size: {len(dataset)}")
+    print(f"Loading RAW dataset structure from: {args.data_dir} with filetype: {args.filetype}")
+    try:
+        raw_dataset = load_dataset(args.data_dir, args.filetype, transform=None)
+        dataset_len = len(raw_dataset)
+        print(f"Initial raw dataset size: {dataset_len}")
+        if dataset_len == 0:
+            print("Error: Loaded raw dataset is empty.")
+            sys.exit(1)
+        
+        graph_transform = GraphPreparationTransform(include_hets=args.include_hets,
+                                                env_radius=args.env_radius,
+                                                max_neighbors=args.max_neighbors)
+        dataset = Atom3DDatasetWrapper(raw_dataset, transform=graph_transform)
+    except Exception as e:
+        print(f"Error loading raw dataset: {e}")
+        sys.exit(1)
 
     if args.num_splits > 1:
         if args.split_id < 1 or args.split_id > args.num_splits:
-             raise ValueError(f"split_id must be between 1 and {args.num_splits}")
-        try:
-             indices = np.arange(len(dataset))
-             split_indices = np.array_split(indices, args.num_splits)[args.split_id - 1]
-             print(f'Processing split {args.split_id}/{args.num_splits} with {len(split_indices)} examples...')
-             dataset = torch.utils.data.Subset(dataset, split_indices)
-        except TypeError:
-             print("Warning: Dataset does not support direct indexing for splitting. Processing full dataset.")
-             out_path = args.out_dir
+            print(f"Error: split_id ({args.split_id}) must be between 1 and {args.num_splits}")
+            sys.exit(1)
+        indices = np.arange(dataset_len)
+        split_indices = np.array_split(indices, args.num_splits)[args.split_id - 1]
+        if len(split_indices) == 0:
+            print(f"Warning: Split {args.split_id} has 0 examples after splitting dataset of size {dataset_len}.")
+        print(f'Processing split {args.split_id}/{args.num_splits} with {len(split_indices)} examples...')
+        dataset = torch.utils.data.Subset(dataset, split_indices)
+        out_path = os.path.join(args.out_dir, f'embeddings_split_{args.split_id}')
     else:
         print(f'Processing full dataset with {len(dataset)} examples...')
         out_path = args.out_dir
 
-    if args.num_splits > 1:
-        out_path = os.path.join(args.out_dir, f'tmp_split_{args.split_id}')
-    else:
-        out_path = args.out_dir
-
     os.makedirs(out_path, exist_ok=True)
-    print(f"Output will be written to: {out_path}")
+    lmdb_path = os.path.join(out_path, 'data.lmdb')
+    print(f"Output LMDB will be written to: {lmdb_path}")
 
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=graph_collate_fn,
+        pin_memory=True if str(device) != 'cpu' else False,
+        worker_init_fn=lambda worker_id: random.seed(seed + worker_id)
+    )
 
-    if args.debug:
-        print("🔍 Debug mode: inspecting first few entries after transform...")
-        count = 0
-        for i, item in enumerate(dataset):
-            if count >= 5: break
-            if item is None:
-                print(f"[{i}] Skipped (transform returned None)")
+    print("Starting embedding generation loop...")
+    start_time = time.time()
+    results_to_save = []
+    processed_count = 0
+    failed_count = 0
+
+    for batch_idx, (graph_batch, metadata_batch) in enumerate(tqdm(dataloader, desc="Processing Batches")):
+        if graph_batch is None or metadata_batch is None:
+            print(f"Warning: Skipping empty batch {batch_idx}")
+            failed_count += args.batch_size
+            continue
+
+        try:
+            # Print memory info before processing batch
+            # if torch.cuda.is_available():
+                # gpu_info = get_gpu_memory_info()
+                # batch_memory = get_batch_memory_usage(graph_batch)
+                # print(f"\nBatch {batch_idx} Memory Information:")
+                # print(f"Number of residues: {len(metadata_batch)}")
+                # print(f"Batch memory usage: {batch_memory}")
+                # for key, value in gpu_info.items():
+                    # print(f"{key}: {value}")
+
+            # Clear CUDA cache before processing each batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Move graph batch to GPU
+            graph_batch = graph_batch.to(device)
+
+            with torch.no_grad():
+                try:
+                    with torch.autocast(device_type=str(device.type), dtype=torch.float16, enabled=(str(device.type) == 'cuda')):
+                        embs, _ = model.online_encoder(graph_batch, return_projection=False)
+                        final_embs = embs.float().cpu().numpy()
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e):
+                        print(f"⚠️ OOM error during GNN inference on batch {batch_idx}. Processing in optimal-sized chunks...")
+                        
+                        # Get list of individual graphs from the batch
+                        graphs = graph_batch.to_data_list()
+                        total_residues = len(graphs)
+                        
+                        # Find optimal chunk size through binary search
+                        chunk_size = find_optimal_chunk_size(graphs, model, device)
+                        print(f"Found optimal chunk size: {chunk_size} residues")
+                        
+                        # Process all residues in chunks
+                        final_embs = []
+                        current_protein_results = col.defaultdict(lambda: col.defaultdict(list))
+                        
+                        for i in range(0, total_residues, chunk_size):
+                            chunk = graphs[i:i + chunk_size]
+                            chunk_meta = metadata_batch[i:i + chunk_size]
+                            
+                            try:
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                
+                                # Create batch from chunk and get embeddings
+                                chunk_batch = Batch.from_data_list(chunk)
+                                chunk_embs = embed_residue_batch(chunk_batch, model, device)
+                                
+                                if chunk_embs is not None:
+                                    final_embs.extend(chunk_embs)
+                                    # Process chunk results
+                                    for j, meta in enumerate(chunk_meta):
+                                        protein_id = meta['protein_id']
+                                        current_protein_results[protein_id]['resids'].append(meta['resid'])
+                                        current_protein_results[protein_id]['chains'].append(meta['chain'])
+                                        current_protein_results[protein_id]['confidence'].append(meta['confidence'])
+                                        processed_count += 1
+                                else:
+                                    print(f"Warning: Chunk {i//chunk_size} returned None embeddings")
+                                    failed_count += len(chunk)
+                                    
+                            except Exception as e:
+                                print(f"Error processing chunk {i//chunk_size}: {e}")
+                                failed_count += len(chunk)
+                                continue
+                        
+                        if not final_embs:
+                            print(f"Warning: No embeddings generated for batch {batch_idx}")
+                            failed_count += len(metadata_batch)
+                            continue
+                            
+                        final_embs = np.stack(final_embs, axis=0)
+                        
+                    else:
+                        raise e
+                except Exception as e:
+                    print(f"Non-runtime error during inference on batch {batch_idx}: {e}")
+                    failed_count += len(list(set(m['protein_id'] for m in metadata_batch)))
+                    continue
+
+            if final_embs is None:
+                print(f"Warning: Embeddings are None after inference for batch {batch_idx}. Skipping.")
+                failed_count += len(list(set(m['protein_id'] for m in metadata_batch)))
                 continue
 
-            protein_id = item.get('id', f'unknown_{i}')
-            print(f"--- Entry {i} | ID: {protein_id} ---")
-            try:
-                if 'embeddings' in item and item['embeddings'] is not None:
-                    print(f"  ✅ Embeddings shape: {item['embeddings'].shape}")
-                    print(f"  Residues found: {len(item.get('resids', []))}")
+            # Process batch results
+            ptr = graph_batch.ptr.cpu().numpy()
+            current_protein_results = col.defaultdict(lambda: col.defaultdict(list))
+
+            if len(metadata_batch) != final_embs.shape[0]:
+                print(f"CRITICAL WARNING: Mismatch after inference! Metadata length ({len(metadata_batch)}) != Embeddings length ({final_embs.shape[0]}) for batch {batch_idx}. Skipping batch.")
+                failed_count += len(list(set(m['protein_id'] for m in metadata_batch)))
+                continue
+
+            for i, meta in enumerate(metadata_batch):
+                protein_id = meta['protein_id']
+                current_protein_results[protein_id]['resids'].append(meta['resid'])
+                current_protein_results[protein_id]['chains'].append(meta['chain'])
+                current_protein_results[protein_id]['confidence'].append(meta['confidence'])
+                current_protein_results[protein_id]['embeddings'].append(final_embs[i])
+
+            for protein_id, data in current_protein_results.items():
+                if data['embeddings']:
+                    data['embeddings'] = np.stack(data['embeddings'], axis=0)
+                    if len(data['resids']) == data['embeddings'].shape[0]:
+                        results_to_save.append({'id': protein_id, **data})
+                        processed_count += 1
+                    else:
+                        print(f"Final internal mismatch for {protein_id}. Resids: {len(data['resids'])}, Embs: {data['embeddings'].shape[0]}. Skipping.")
+                        failed_count += 1
                 else:
-                    print(f"  ❌ No embeddings found for {protein_id}")
+                    print(f"No embeddings collected for {protein_id}. Skipping.")
+                    failed_count += 1
 
-            except Exception as e:
-                 print(f"  💥 Error inspecting item {protein_id}: {e}")
+        except Exception as e:
+            print(f"Unexpected error processing batch {batch_idx}: {e}")
+            failed_count += args.batch_size
+            continue
 
-            count += 1
-            print("-" * 20)
-    else:
-        print("Starting LMDB dataset creation...")
-        start_time = time.time()
-        make_lmdb_dataset(dataset, out_path,
-                          serialization_format='pkl',
-                          filter_fn=lambda x: x is None)
-        end_time = time.time()
-        print(f"LMDB dataset creation finished in {end_time - start_time:.2f} seconds.")
+    end_time = time.time()
+    print(f"Embedding generation loop finished in {end_time - start_time:.2f} seconds.")
+    print(f"Successfully processed: {processed_count} proteins.")
+    print(f"Failed/Skipped: {failed_count} proteins (due to errors or OOM).")
+
+    print(f"Writing {len(results_to_save)} results to LMDB: {lmdb_path}")
+    if not results_to_save:
+        print("No results to save.")
+        return
+
+    map_size = 1024 * 1024 * 1024 * 50  # 50 GB initial size
+
+    try:
+        env = lmdb.open(lmdb_path, map_size=map_size)
+        with env.begin(write=True) as txn:
+            for i, result_dict in enumerate(tqdm(results_to_save, desc="Writing LMDB")):
+                key = result_dict['id'].encode('utf-8')
+                value = pickle.dumps(result_dict)
+                txn.put(key, value)
+        env.close()
+        print("LMDB writing complete.")
+    except Exception as e:
+        print(f"Error writing to LMDB: {e}")
+        import traceback; traceback.print_exc()
+
 
 if __name__ == '__main__':
     main()
