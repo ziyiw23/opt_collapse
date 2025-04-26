@@ -63,6 +63,13 @@ if args.debug:
 
 db_pdbcodes = np.array([p[:4] for p in db_pdbs])
 
+# After loading database
+print("\nDatabase statistics:")
+print(f"- Number of embeddings: {len(db_embeddings)}")
+print(f"- Embedding dimension: {db_embeddings.shape[1]}")
+print(f"- Number of unique sites: {len(set(db_labels))}")
+print(f"- Cutoff value: {cutoff}")
+
 for pdb_data in dataset:
     if pdb_data is None and args.mode == 'optimized':
         print("⚠️ Skipping failed transform (None)")
@@ -100,6 +107,11 @@ for pdb_data in dataset:
         chains = chains[chain_idx]
         embeddings = embeddings[chain_idx]
         
+    # Before cosine calculation
+    print("\nInput statistics:")
+    print(f"- Number of residues: {len(embeddings)}")
+    print(f"- Embedding dimension: {embeddings.shape[1]}")
+    print(f"- Sample embedding mean/std: {embeddings.mean():.6f}/{embeddings.std():.6f}")
     
     cosines = fastdist.cosine_matrix_to_matrix(embeddings, db_embeddings)  # (n_res, n_db)
     
@@ -123,9 +135,20 @@ for pdb_data in dataset:
             else:
                 results[key][chain_res] = set([f'{db_pdbs[h]}: {db_resids[h]}'])
     
-    print('Results at p = ', args.cutoff)
+    # After cosine calculation
+    print("\nSimilarity statistics:")
+    print(f"- Cosine matrix shape: {cosines.shape}")
+    print(f"- Max similarity: {cosines.max():.6f}")
+    print(f"- Mean similarity: {cosines.mean():.6f}")
+    print(f"- Number of hits above cutoff: {query_mask.sum()}")
+    print(f"- Number of hits above site cutoff: {site_mask.sum()}")
+    print(f"- Number of final hits: {quantile_mask.sum()}")
+
+    # After processing hits
+    print("\nResults statistics:")
+    print(f"- Number of result keys: {len(results)}")
     for (name, source), sites in results.items():
-        print(f' {name} ({source})')
+        print(f"- {name} ({source}): {sum(len(pdbs) for pdbs in sites.values())} total hits")
         for loc, pdbs in sites.items():
             if args.verbose:
                 print(f"    - {loc}: {pdbs}")

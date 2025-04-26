@@ -329,7 +329,7 @@ def extract_env_from_resid(df, ch_resid, env_radius=10.0, res_df=None, ca_center
     pt_idx = kd_tree.query_ball_point(center, r=env_radius, p=2.0)
     df_env = df.iloc[pt_idx, :]
 
-    df_env = df_env.sort_values(by=['chain', 'residue', 'name', 'x', 'y', 'z'])
+    df_env = chain_atoms_df.iloc[pt_idx_cpu].reset_index(drop=True)
     # debug_print_atom_set(df_env, tag=f"{ch_resid} (sorted order)")
     
     if len(df_env) == 0:
