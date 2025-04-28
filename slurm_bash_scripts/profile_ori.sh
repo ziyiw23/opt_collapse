@@ -19,8 +19,10 @@ ml devel cuda/11.7.1 gcc/12.4.0
 conda activate collapse
 
 SCRIPT="embed_pdb_dataset.py"
-DATA_IN="/scratch/groups/rbaltman/ziyiw23/clps_pdbs/"
-DATA_OUT="/scratch/groups/rbaltman/ziyiw23/clps_embed/ori_res"
+# DATA_IN="/scratch/groups/rbaltman/ziyiw23/clps_pdbs/"
+DATA_IN="/scratch/groups/rbaltman/ziyiw23/1000_pdbs/"
+# DATA_OUT="/scratch/groups/rbaltman/ziyiw23/clps_embed/ori_res"
+DATA_OUT="/scratch/groups/rbaltman/ziyiw23/clps_embed/ori_res_1000"
 PROFILE_OUT="profile_ori.prof"
 
 rm -rf "$DATA_OUT"/*

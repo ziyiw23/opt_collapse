@@ -37,6 +37,7 @@ rm -rf "$OUT_DIR"/*
 echo "Running compare_embed.py..."
 python3 "$SCRIPT" --original "$ORIGINAL_DB" --out_dir "$OUT_DIR" \
     --optimized "$OPTIMIZED_DB" \
+    --inspect \
     # --second_ori "$SECOND_ORI_DB"
 
 echo "Execution of compare_embed.py completed."

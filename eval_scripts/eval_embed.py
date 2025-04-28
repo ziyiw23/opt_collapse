@@ -10,6 +10,8 @@ import gzip
 from tqdm import tqdm
 import argparse
 import os
+import io
+import random
 
 # srun --partition=rbaltman \
 #      --nodes=1 \
@@ -108,6 +110,140 @@ def plot_tsne(original_embeddings, original_metadata, optimized_embeddings, opti
     plt.tight_layout()
     plt.savefig(output_path)
     print(f"Saved t-SNE plot to {output_path}")
+
+
+def inspect_lmdb(lmdb_path, num_examples_to_show=3, show_array_shapes=True):
+    """
+    Inspects an LMDB dataset created by gen_embed.py or atom3d.
+
+    Args:
+        lmdb_path (str): Path to the LMDB directory (containing data.mdb).
+        num_examples_to_show (int): How many specific examples to read and display.
+        show_array_shapes (bool): Whether to print the shapes of numpy arrays found.
+    """
+    print(f"--- Inspecting LMDB: {lmdb_path} ---")
+
+    if not os.path.isdir(lmdb_path):
+        print(f"Error: LMDB directory not found at {lmdb_path}")
+        return
+
+    try:
+        # Use subdir=True as atom3d datasets are directories
+        # readonly=True is safer for inspection
+        # lock=False might be necessary if the lock file is stale
+        env = lmdb.open(lmdb_path, readonly=True, subdir=True, lock=False)
+    except lmdb.Error as e:
+        print(f"Error opening LMDB environment: {e}")
+        return
+
+    num_examples = 0
+    id_to_idx_type = "Not Found"
+    id_to_idx_sample = {}
+
+    try:
+        with env.begin() as txn:
+            # Read metadata
+            num_examples_bytes = txn.get(b'num_examples')
+            if num_examples_bytes:
+                num_examples = int(num_examples_bytes.decode())
+                print(f"Metadata - num_examples: {num_examples}")
+            else:
+                print("Metadata - num_examples: Not found (may need to infer from cursor)")
+                # Alternative way to estimate count if metadata key is missing
+                num_examples = int(txn.stat()['entries']) - 3 # Subtract metadata keys usually
+                print(f"Inferred count from entries: ~{num_examples}")
+
+
+            serialization_format_bytes = txn.get(b'serialization_format')
+            if serialization_format_bytes:
+                serialization_format = serialization_format_bytes.decode()
+                print(f"Metadata - serialization_format: {serialization_format}")
+                if serialization_format != 'pkl':
+                     print(f"Warning: Expected serialization format 'pkl', found '{serialization_format}'. Deserialization might fail.") # Fixed f-string
+            else:
+                print("Metadata - serialization_format: Not found (assuming 'pkl')")
+                serialization_format = 'pkl' # Default assumption
+
+            id_to_idx_bytes = txn.get(b'id_to_idx')
+            if id_to_idx_bytes:
+                try:
+                    id_to_idx = pickle.loads(id_to_idx_bytes)
+                    id_to_idx_type = type(id_to_idx)
+                    if isinstance(id_to_idx, dict):
+                         id_to_idx_sample = dict(list(id_to_idx.items())[:min(3, len(id_to_idx))])
+                    print(f"Metadata - id_to_idx: Found (type: {id_to_idx_type}), Sample: {id_to_idx_sample}")
+                except Exception as e:
+                    print(f"Metadata - id_to_idx: Found but failed to deserialize: {e}")
+            else:
+                 print(f"Metadata - id_to_idx: Not Found")
+
+
+            if num_examples == 0:
+                print("No examples found based on metadata or inference.")
+                return
+
+            # Inspect a few examples
+            indices_to_inspect = list(range(min(num_examples_to_show, num_examples)))
+            if num_examples > num_examples_to_show:
+                 # Add a random index if possible
+                 try:
+                      random_idx = random.randint(num_examples_to_show, num_examples - 1)
+                      if random_idx not in indices_to_inspect:
+                           indices_to_inspect.append(random_idx)
+                 except ValueError: # Handle case where num_examples <= num_examples_to_show
+                      pass
+
+            print(f"\nInspecting entries at indices: {indices_to_inspect}...")
+
+            for i in indices_to_inspect:
+                print(f"\n--- Entry Index: {i} ---")
+                key = str(i).encode('utf-8')
+                compressed_value = txn.get(key)
+
+                if compressed_value is None:
+                    print("  Error: Entry not found.")
+                    continue
+
+                try:
+                    # Decompress and deserialize
+                    buf = io.BytesIO(compressed_value)
+                    with gzip.GzipFile(fileobj=buf, mode='rb') as f:
+                        data = pickle.load(f)
+
+                    print(f"  Keys: {list(data.keys())}")
+
+                    # Print details of some keys, especially array shapes
+                    if 'id' in data: print(f"  id: {data['id']}")
+                    if 'pooling_type' in data: print(f"  pooling_type: {data['pooling_type']}")
+
+                    if show_array_shapes:
+                        for k, v in data.items():
+                            if isinstance(v, np.ndarray):
+                                print(f"  {k}: numpy array, shape={v.shape}, dtype={v.dtype}")
+                            elif isinstance(v, list) and v and isinstance(v[0], np.ndarray):
+                                # Handle lists of arrays if they weren't stacked (shouldn't happen with current gen_embed)
+                                try:
+                                     stacked = np.stack(v)
+                                     print(f"  {k}: list of numpy arrays, stacked shape={stacked.shape}, first dtype={v[0].dtype}")
+                                except ValueError:
+                                     print(f"  {k}: list of numpy arrays (cannot stack), count={len(v)}, first shape={v[0].shape}, first dtype={v[0].dtype}")
+                            elif isinstance(v, (list, dict)) and k != 'types':
+                                 print(f"  {k}: {type(v).__name__}, length/size={len(v)}")
+
+
+                except pickle.UnpicklingError as e:
+                    print(f"  Error deserializing entry {i}: {e}")
+                except gzip.BadGzipFile as e:
+                    print(f"  Error decompressing entry {i}: {e}")
+                except Exception as e:
+                    print(f"  Unexpected error processing entry {i}: {e}")
+
+    except lmdb.Error as e:
+        print(f"Error during LMDB transaction: {e}")
+    finally:
+        if 'env' in locals() and env:
+            env.close()
+            print("\n--- LMDB Inspection Complete ---")
 
 
 if __name__ == "__main__":

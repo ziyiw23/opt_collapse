@@ -18,7 +18,8 @@ import collections as col
 from scipy.stats import entropy
 from collapse import atom_info
 from torch.utils.data.dataloader import default_collate
-from torch_geometric.data import Batch, Data
+from torch_geometric.data import Batch
+from torch_geometric.data.data import BaseData, Data
 import torch_cluster
 from collections.abc import Mapping, Sequence
 from collapse.byol_pytorch import BYOL
@@ -162,7 +163,6 @@ class BaseTransform:
 """
 Instantiate general graph transform for all environment processing.
 """    
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 transform = BaseTransform()
 
 # =========================
@@ -227,8 +227,6 @@ def embed_protein(atom_df, model, device='cpu', include_hets=True, env_radius=10
             if "CUDA out of memory" not in str(e): raise(e)
             torch.cuda.empty_cache()
             print('Out of Memory error!', flush=True)
-            protein_id = atom_df.get('id', 'unknown') if isinstance(atom_df, dict) else atom_df.get('id', 'unknown')
-            print(f"⚠️  OOM on protein {protein_id}, skipped.")
             return None
     emb_data['embeddings'] = np.stack(embs.cpu().numpy(), 0)
     return emb_data
@@ -290,22 +288,7 @@ def sample_functional_center(df, resid, train_mode=True):
     center = np.mean(coords, axis=0)
     return center
 
-def debug_print_atom_set(df_env, tag=""):
-    """
-    Print sorted list of atom tuples for debugging.
-    Each tuple: (chain, residue, atom name, x, y, z)
-    """
-    # Extract columns and convert to list of tuples
-    atoms = df_env[['chain', 'residue', 'name', 'x', 'y', 'z']].to_numpy().tolist()
-    # Sort the list for consistent ordering (e.g. by chain, residue, atom name, x, y, z)
-    # atoms_sorted = sorted([tuple(atom) for atom in atoms])
-    atoms_sorted = [tuple(atom) for atom in atoms]
-    print(f"{tag} Atom set (sorted):")
-    for atom in atoms_sorted:
-        print(atom)
-
 def extract_env_from_resid(df, ch_resid, env_radius=10.0, res_df=None, ca_center=False, train_mode=False):
-    # print(f'============={ch_resid}=============')
     chain, resid = ch_resid
     if resid[0] == 'X':
         #print('Nonstandard residue')
@@ -322,15 +305,12 @@ def extract_env_from_resid(df, ch_resid, env_radius=10.0, res_df=None, ca_center
     else:
         center = sample_functional_center(res_df, resid, train_mode)
     # center = np.mean(res_df[['x', 'y', 'z']].astype(np.float32).to_numpy(), axis=0)
-    # print(f"Computed center for {ch_resid}: {center}")    
-    df = df.reset_index(drop=True)
+        
+    df = df.reset_index()
     kd_tree = scipy.spatial.cKDTree(df[['x', 'y', 'z']].to_numpy())
 
     pt_idx = kd_tree.query_ball_point(center, r=env_radius, p=2.0)
     df_env = df.iloc[pt_idx, :]
-
-    df_env = chain_atoms_df.iloc[pt_idx_cpu].reset_index(drop=True)
-    # debug_print_atom_set(df_env, tag=f"{ch_resid} (sorted order)")
     
     if len(df_env) == 0:
         print('No environment found')
@@ -340,11 +320,7 @@ def extract_env_from_resid(df, ch_resid, env_radius=10.0, res_df=None, ca_center
         return None
     
     graph = transform(df_env)
-
-    # print(f"Processing {ch_resid}")
-    # print("Original selection count:", len(pt_idx))
-    # print("Edge index shape:", graph.edge_index.shape)
-    # print("Edge features mean:", graph.edge_s.mean(), graph.edge_v.mean())
+    
     return graph
 
 def extract_env_from_coords(df, center, env_radius=10.0):
@@ -1182,7 +1158,7 @@ class NoneCollater:
         if filter_batch:
             batch = [item for b in batch for item in b if ((len(item)==2) and (item[0][0] is not None) and (item[0][1] is not None))]# if (item[0][0] is not None) & (item[0][1] is not None)]
         elem = batch[0]
-        if isinstance(elem, Data):
+        if isinstance(elem, BaseData):
             return Batch.from_data_list(batch, self.follow_batch,
                                         self.exclude_keys)
         elif isinstance(elem, torch.Tensor):

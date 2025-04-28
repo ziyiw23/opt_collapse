@@ -9,9 +9,42 @@ import matplotlib.pyplot as plt
 import scipy.stats
 import pandas as pd
 from scipy.spatial import procrustes
+import pprint
+import io
+import random
+from typing import Tuple, Dict, List, Any, Optional
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+# python eval_scripts/compare_embed.py --original /scratch/groups/rbaltman/ziyiw23/clps_embed/ori_res_1000 --optimized /scratch/groups/rbaltman/ziyiw23/clps_embed/opt_res_1000
 
 # List of evaluation metrics (Procrustes will now be computed globally)
 eval_metrics = ['cosine', 'flipped_cosine', 'pcc', 'l2_diff', 'mse', 'spearman']
+
+# --- Constants and Style Configuration ---
+DEFAULT_N_SAMPLES: int = 5000
+DEFAULT_PCA_COMPONENTS: int = 50
+DEFAULT_TSNE_PERPLEXITY: int = 30
+RANDOM_STATE: int = 42
+DEFAULT_OUTPUT_FILENAME: str = "t-sne_comparison_plot.png"
+OUTPUT_DIR: str = "/home/users/ziyiw23/COLLAPSE/embed_eval_output/" # Define output dir
+
+# Matplotlib/Seaborn styling
+# plt.style.use('seaborn-v0_8-darkgrid') # Example of a modern style
+sns.set_palette("husl")
+plt.rcParams.update({
+    'font.size': 12,
+    'figure.dpi': 150,
+    'savefig.dpi': 300,
+    'axes.titlesize': 14,
+    'axes.labelsize': 12,
+    'xtick.labelsize': 10,
+    'ytick.labelsize': 10,
+    'legend.fontsize': 10,
+})
+# Ensure output directory exists
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def inspect_lmdb(lmdb_dir, output_file="inspect_output.txt", limit=10):
     env = lmdb.open(lmdb_dir, readonly=True, lock=False)
@@ -263,16 +296,89 @@ def delete_files_in_directory(directory_path):
     except OSError:
         print("Error occurred while deleting files.")
 
+# --- NEW INSPECTION FUNCTION ---
+def inspect_first_embeddings(lmdb_dir, limit=5):
+    """
+    Inspects and prints the content of the first few data entries in an LMDB database.
+
+    Args:
+        lmdb_dir (str): Path to the LMDB database directory.
+        limit (int): Number of entries to inspect.
+    """
+    print(f"\n--- Inspecting first {limit} data entries from {lmdb_dir} ---")
+    inspected_count = 0
+    
+    try:
+        env = lmdb.open(lmdb_dir, readonly=True, lock=False)
+    except lmdb.Error as e:
+        print(f"Error opening LMDB {lmdb_dir}: {e}")
+        return
+
+    with env.begin() as txn:
+        cursor = txn.cursor()
+        for key_bytes, value in cursor:
+            if inspected_count >= limit:
+                break
+
+            key = key_bytes.decode('utf-8')
+            
+            # Only process numeric keys which represent the data entries
+            if not key.isdigit():
+                print(f"  Skipping non-numeric key: {key}")
+                continue
+                
+            print(f"\n--- Entry Key: {key} ---")
+            try:
+                # Decompress and deserialize
+                data = pickle.loads(gzip.decompress(value))
+                
+                print(f"  Data Type: {type(data)}")
+                if isinstance(data, dict):
+                    print("  Content:")
+                    # Use pprint for better readability of the dictionary
+                    # Limit embedding printing if it's large
+                    data_to_print = {}
+                    for k, v in data.items():
+                        if k == 'embeddings' and isinstance(v, np.ndarray):
+                            data_to_print[k] = f"Numpy Array (shape: {v.shape}, dtype: {v.dtype}) - First few elements: {v.flatten()[:10]}..."
+                        elif isinstance(v, list) and len(v) > 10:
+                             data_to_print[k] = f"List (length: {len(v)}) - First 10: {v[:10]}..."
+                        else:
+                             data_to_print[k] = v
+                    pprint.pprint(data_to_print, indent=4)
+                else:
+                    # Fallback for non-dict data (shouldn't happen with current gen_embed)
+                    print(f"  Content: {data}")
+
+                inspected_count += 1
+
+            except gzip.BadGzipFile:
+                print(f"  Error decompressing value. Is it gzipped?")
+            except pickle.UnpicklingError:
+                 print(f"  Error unpickling value.")
+            except Exception as e:
+                print(f"  Unexpected error during inspection: {e}")
+
+    env.close()
+    if inspected_count == 0:
+        print("  No valid data entries found to inspect within the key range checked.")
+    print(f"\n--- Finished inspecting {inspected_count} entries ---")
+
 def main():
     parser = argparse.ArgumentParser(description="Memory-efficient embedding comparison with additional metrics")
     parser.add_argument('--original', required=True, help="Original LMDB directory")
     parser.add_argument('--optimized', required=True, help="Optimized LMDB directory")
     parser.add_argument('--out_dir', default="/home/users/ziyiw23/COLLAPSE/embed_eval_output", help="Output directory")
     parser.add_argument('--second_ori', default=None, help="Second original LMDB directory for comparison")
+    parser.add_argument('--inspect', action='store_true', help="Inspect first few optimized embeddings data structure.")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     delete_files_in_directory(args.out_dir)
+    
+    if args.inspect:
+        inspect_first_embeddings(args.optimized, limit=5)
+        print("\nInspection complete. Continuing with comparison...")
     
     common_keys = get_common_diff_keys(args.original, args.optimized, args.out_dir)
     if not common_keys:

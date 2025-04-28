@@ -278,22 +278,20 @@ def main():
                         all_protein_embs = np.concatenate(protein_embeddings_list, axis=0)
                         # Check if number of embeddings matches number of graphs processed
                         if all_protein_embs.shape[0] == num_residues:
-                            # --- Mean Pooling ---
-                            mean_embedding = np.mean(all_protein_embs, axis=0, dtype=np.float32)
-                            # --- Store Mean Embedding ---
-                            # We lose per-residue info, just store the mean representation
-                            results_this_batch[protein_id]['embeddings'] = [mean_embedding] # Store as a list containing one item
-                            results_this_batch[protein_id]['pooling_type'] = ['mean_oom_fallback'] # Flag it
-                            # Keep metadata from the first residue for reference? Or average confidence?
-                            results_this_batch[protein_id]['resids'] = [protein_metadata[0]['resid']]
-                            results_this_batch[protein_id]['chains'] = [protein_metadata[0]['chain']]
-                            results_this_batch[protein_id]['confidence'] = [np.mean([m['confidence'] for m in protein_metadata])]
-                            print(f"  ✓ Fallback successful for {protein_id} (Mean Pooled).")
+                            # --- Store Per-Residue Embeddings (like normal case) --- ## MODIFIED ##
+                            # We now store the full per-residue embeddings even in fallback
+                            results_this_batch[protein_id]['embeddings'] = [all_protein_embs] # Store 2D array in list
+                            results_this_batch[protein_id]['pooling_type'] = ['chunked_oom_fallback'] # Flag how it was generated
+                            # Keep metadata from all residues
+                            results_this_batch[protein_id]['resids'] = [m['resid'] for m in protein_metadata]
+                            results_this_batch[protein_id]['chains'] = [m['chain'] for m in protein_metadata]
+                            results_this_batch[protein_id]['confidence'] = [m['confidence'] for m in protein_metadata]
+                            print(f"  ✓ Fallback successful for {protein_id} (Stored {all_protein_embs.shape[0]} residue embeddings).") # Updated message
                         else:
                             print(f"  ❌ Mismatch after fallback concatenation for {protein_id}: {all_protein_embs.shape[0]} vs {num_residues}. Skipping.")
                             protein_failed_chunking = True # Mark as failed
-                    except Exception as pool_e:
-                        print(f"  ❌ Error during pooling/storing fallback for {protein_id}: {pool_e}")
+                    except Exception as store_e: # Changed exception name
+                        print(f"  ❌ Error during storing fallback result for {protein_id}: {store_e}") # Updated message
                         protein_failed_chunking = True
 
                 if protein_failed_chunking:
@@ -307,30 +305,61 @@ def main():
         # --- Finalize and Add Results from Batch ---
         # This loop now handles results from both normal processing and successful fallbacks
         for protein_id, data in results_this_batch.items():
-            if data['embeddings']: # Check if embeddings were actually populated
-                # Embeddings should already be numpy array(s)
-                if isinstance(data['embeddings'], list): # Should be list for both cases now
-                    # Stack if it's per-residue, keep as is if mean-pooled (already numpy)
-                    if 'pooling_type' not in data: # Normal per-residue case
+            if data.get('embeddings'): # Check if embeddings key exists and is not empty
+                embedding_list = data['embeddings']
+                embedding_array = None
+
+                if isinstance(embedding_list, list) and embedding_list:
+                    if len(embedding_list) > 1: # Normal case: List of per-residue embeddings
                         try:
-                            data['embeddings'] = np.stack(data['embeddings'], axis=0)
+                            # Check if all elements are numpy arrays before stacking
+                            if all(isinstance(emb, np.ndarray) for emb in embedding_list):
+                                embedding_array = np.stack(embedding_list, axis=0)
+                            else:
+                                print(f"\nWarning: Non-numpy array found in embedding list for {protein_id}. Skipping.")
+                                failed_protein_count += 1
+                                continue
                         except Exception as stack_e:
                             print(f"\nError stacking embeddings for {protein_id} (normal path): {stack_e}")
                             failed_protein_count += 1
                             continue # Skip this protein
-                    else: # Mean-pooled case
-                        data['embeddings'] = data['embeddings'][0] # Get the single numpy array
 
-                # Final check again
-                if 'pooling_type' in data or len(data.get('resids', [])) == data['embeddings'].shape[0]:
-                    results_to_save.append({'id': protein_id, **data})
-                    processed_protein_count += 1
+                    elif len(embedding_list) == 1: # OOM Fallback case: List containing one 2D array
+                         # Check if the single element is a numpy array
+                         if isinstance(embedding_list[0], np.ndarray):
+                              embedding_array = embedding_list[0]
+                         else:
+                              print(f"\nWarning: Single element in embedding list for {protein_id} is not a numpy array. Type: {type(embedding_list[0])}. Skipping.")
+                              failed_protein_count += 1
+                              continue
+                # else: Empty list or not a list
+                #     pass # Let the next check handle None
+
+                # --- Proceed if we have a valid 2D embedding_array --- 
+                if embedding_array is not None:
+                     data['embeddings'] = embedding_array # Store the final 2D array
+
+                     # Check if the number of metadata items matches the first dimension of the embedding array
+                     num_meta_items = len(data.get('resids', []))
+                     if num_meta_items == embedding_array.shape[0]:
+                          results_to_save.append({'id': protein_id, **data})
+                          processed_protein_count += 1
+                          # Accumulate residue count based on successful processing
+                          processed_residue_count += embedding_array.shape[0] # This count was wrong before
+                     else:
+                          print(f"\nFinal internal mismatch for {protein_id} before saving. Metadata count ({num_meta_items}) != Embeddings dim 0 ({embedding_array.shape[0]}). Skipping.")
+                          # Avoid double counting if already marked failed during fallback
+                          if not data.get('pooling_type', None) or 'chunked_oom_fallback' not in data['pooling_type']:
+                               failed_protein_count +=1 # Only count failure here if not already counted in fallback
                 else:
-                    print(f"\nFinal internal mismatch for {protein_id} before saving. Skipping.")
-                    # Avoid double counting if already marked failed during fallback
-                    # failed_protein_count += 1 # Might double count here
-                    # Instead rely on fallback incrementing the count
-                    pass
+                    # This handles cases where the list was empty, not a list, or stacking failed
+                    print(f"\nWarning: Could not obtain valid embedding array for {protein_id}. Skipping.")
+                    # Avoid double counting if already marked failed
+                    if protein_id not in (p_id for p_id, d in results_this_batch.items() if d.get('pooling_type')): # Check if not already failed fallback
+                        failed_protein_count += 1
+            # else: # Handles cases where embeddings key might be missing or empty initially
+                # Failure potentially already counted during fallback attempt or initial inference error
+                pass
 
 # --- End Main Loop ---
 

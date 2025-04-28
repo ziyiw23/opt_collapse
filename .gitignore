@@ -15,7 +15,6 @@ __pycache__/
 *.prof
 profile_*.*
 embed_eval_output/
-slurm_bash_scripts/
 logs/
 
 # Environment files
