@@ -19,8 +19,8 @@ from sklearn.manifold import TSNE
 
 # python eval_scripts/compare_embed.py --original /scratch/groups/rbaltman/ziyiw23/clps_embed/ori_res_1000 --optimized /scratch/groups/rbaltman/ziyiw23/clps_embed/opt_res_1000
 
-# List of evaluation metrics (Procrustes will now be computed globally)
-eval_metrics = ['cosine', 'flipped_cosine', 'pcc', 'l2_diff', 'mse', 'spearman']
+# List of evaluation metrics for residue-level comparison
+eval_metrics = ['cosine', 'l2_diff', 'mse'] # Removed pcc, spearman as they are less meaningful for single vectors
 
 # --- Constants and Style Configuration ---
 DEFAULT_N_SAMPLES: int = 5000
@@ -73,218 +73,284 @@ def inspect_lmdb(lmdb_dir, output_file="inspect_output.txt", limit=10):
                     break
 
 def get_common_diff_keys(original_dir, optimized_dir, out_dir):
-    """Get intersection of numeric keys from both databases"""
+    """Get intersection of numeric keys (representing proteins/entries) from both databases"""
     def numeric_keys(env):
         with env.begin() as txn:
-            return {k.decode() for k in txn.cursor().iternext(values=False) if k.decode().isdigit()}
-    
+            # Check for id_to_idx first, which maps protein IDs to numeric keys
+            id_map_bytes = txn.get(b'id_to_idx')
+            if id_map_bytes:
+                id_map = pickle.loads(id_map_bytes)
+                # Return the protein IDs which are the logical keys
+                return set(id_map.keys())
+            else:
+                # Fallback: assume numeric keys directly represent proteins if id_to_idx is missing
+                print("Warning: id_to_idx not found in LMDB. Falling back to numeric keys.")
+                return {k.decode() for k in txn.cursor().iternext(values=False) if k.decode().isdigit()}
+
     orig_env = lmdb.open(original_dir, readonly=True, lock=False)
     opt_env = lmdb.open(optimized_dir, readonly=True, lock=False)
-    
+
     orig_keys = numeric_keys(orig_env)
     opt_keys = numeric_keys(opt_env)
-    
+
     orig_env.close()
     opt_env.close()
-    
-    print(f"Original DB has {len(orig_keys)} numeric entries")
-    print(f"Optimized DB has {len(opt_keys)} numeric entries")
-    
-    common = sorted(orig_keys & opt_keys)
-    print(f"Found {len(common)} common numeric entries")
+
+    print(f"Original DB has {len(orig_keys)} protein entries (from id_to_idx or numeric keys)")
+    print(f"Optimized DB has {len(opt_keys)} protein entries (from id_to_idx or numeric keys)")
+
+    common = sorted(list(orig_keys & opt_keys))
+    print(f"Found {len(common)} common protein entries")
 
     # Different keys
-    only_in_orig = sorted(orig_keys - opt_keys)
-    only_in_opt = sorted(opt_keys - orig_keys)
+    only_in_orig = sorted(list(orig_keys - opt_keys))
+    only_in_opt = sorted(list(opt_keys - orig_keys))
 
     print(f"Found {len(only_in_orig)} keys only in the original DB")
     print(f"Found {len(only_in_opt)} keys only in the optimized DB")
 
     if len(only_in_orig) > 0:
-        with open(os.path.join(out_dir, "only_in_orig.txt"), "w") as f:
+        with open(os.path.join(out_dir, "only_in_orig_proteins.txt"), "w") as f:
             for key in only_in_orig:
                 f.write(f"{key}\n")
     if len(only_in_opt) > 0:
-        with open(os.path.join(out_dir, "only_in_opt.txt"), "w") as f:
+        with open(os.path.join(out_dir, "only_in_opt_proteins.txt"), "w") as f:
             for key in only_in_opt:
                 f.write(f"{key}\n")
 
-    return common
+    return common # Returns list of common protein IDs
 
-def get_embedding(txn, key):
-    """Extract and average 2D embeddings to 1D"""
+def get_protein_data(txn, protein_id_or_numeric_key, id_map=None):
+    """Extracts the full data dictionary for a protein entry."""
     try:
-        value = txn.get(key.encode())
+        # Determine the actual LMDB key (numeric index)
+        if id_map:
+            if protein_id_or_numeric_key not in id_map:
+                print(f"Error: Protein ID {protein_id_or_numeric_key} not found in id_map.")
+                return None
+            numeric_key = str(id_map[protein_id_or_numeric_key])
+        else:
+            # Assume the key provided is already the numeric key
+            numeric_key = str(protein_id_or_numeric_key)
+
+        value = txn.get(numeric_key.encode())
         if not value:
+            # print(f"Warning: No value found for key {numeric_key} (Protein: {protein_id_or_numeric_key}).")
             return None
-        data = pickle.loads(gzip.decompress(value))
-        emb_2d = data['embeddings'].astype(np.float32)
-        return emb_2d.mean(axis=0)  # Shape becomes (512,)
+        # Decompress and unpickle
+        decompressed_value = gzip.decompress(value)
+        data = pickle.loads(decompressed_value)
+
+        # Validate expected keys
+        if not isinstance(data, dict) or 'embeddings' not in data or 'chains' not in data or 'resids' not in data:
+             print(f"Warning: Invalid data format for key {numeric_key}. Missing required keys.")
+             # print(f"Data: {data}") # Optional: Print problematic data
+             return None
+
+        # Ensure embeddings are numpy array
+        if not isinstance(data['embeddings'], np.ndarray):
+             print(f"Warning: Embeddings are not a numpy array for key {numeric_key}.")
+             return None
+
+        # Ensure metadata lists have same length as embeddings first dimension
+        num_res = data['embeddings'].shape[0]
+        if not (len(data['chains']) == num_res and len(data['resids']) == num_res):
+            print(f"Warning: Metadata length mismatch for key {numeric_key}. Embeddings: {num_res}, Chains: {len(data['chains'])}, Resids: {len(data['resids'])}.")
+            return None # Skip inconsistent entries
+
+        # Cast embeddings to float32 for consistency
+        data['embeddings'] = data['embeddings'].astype(np.float32)
+        return data # Return the full dictionary
+
+    except lmdb.Error as e:
+        print(f"LMDB Error processing key {protein_id_or_numeric_key}: {e}")
+        return None
+    except gzip.BadGzipFile:
+        print(f"Error: Bad Gzip data for key {protein_id_or_numeric_key}. Not gzipped?")
+        return None
+    except pickle.UnpicklingError as e:
+        print(f"Error unpickling data for key {protein_id_or_numeric_key}: {e}")
+        return None
     except Exception as e:
-        print(f"Error processing {key}: {e}")
+        print(f"General Error processing key {protein_id_or_numeric_key}: {type(e).__name__}: {e}")
+        import traceback
+        # traceback.print_exc() # Uncomment for detailed traceback
         return None
 
-def compute_metrics(orig_emb, opt_emb, centroid):
+def compute_residue_metrics(orig_emb_1d, opt_emb_1d):
     """
-    For two 1D embeddings and a centroid (computed over centered embeddings),
-    compute the following metrics:
-      - cosine similarity between centered embeddings
-      - cosine similarity after flipping the optimized embedding
-      - Pearson correlation coefficient (pcc) between raw embeddings
-      - L2 norm difference between raw embeddings
-      - Mean Squared Error (MSE) between raw embeddings
-      - Spearman's rank correlation coefficient between raw embeddings
-    """
-    # Center both embeddings
-    orig_centered = orig_emb - centroid
-    opt_centered = opt_emb - centroid
+    Computes metrics between two individual 1D residue embedding vectors.
+    Args:
+        orig_emb_1d (np.ndarray): 1D numpy array for original embedding.
+        opt_emb_1d (np.ndarray): 1D numpy array for optimized embedding.
 
-    norm_orig = orig_centered / (np.linalg.norm(orig_centered) + 1e-8)
-    norm_opt = opt_centered / (np.linalg.norm(opt_centered) + 1e-8)
-    
-    cosine = np.dot(norm_orig, norm_opt)
-    flipped_cosine = np.dot(norm_orig, -norm_opt)
-    
-    # Pearson correlation on raw embeddings
-    pcc, _ = scipy.stats.pearsonr(orig_emb.flatten(), opt_emb.flatten())
-    
-    # L2 norm difference between raw embeddings
-    l2_diff = np.linalg.norm(orig_emb - opt_emb)
-    
-    # Mean Squared Error (MSE) between raw embeddings
-    mse = np.mean((orig_emb - opt_emb) ** 2)
-    
-    # Spearman's rank correlation coefficient on raw embeddings
-    spearman_corr, _ = scipy.stats.spearmanr(orig_emb.flatten(), opt_emb.flatten())
-    
+    Returns:
+        dict: Dictionary containing computed metrics.
+    """
+    if orig_emb_1d is None or opt_emb_1d is None or orig_emb_1d.shape != opt_emb_1d.shape or orig_emb_1d.ndim != 1:
+        return {metric: np.nan for metric in eval_metrics} # Return NaNs if input invalid
+
+    # Cosine Similarity
+    norm_orig = np.linalg.norm(orig_emb_1d)
+    norm_opt = np.linalg.norm(opt_emb_1d)
+    if norm_orig < 1e-8 or norm_opt < 1e-8: # Avoid division by zero for zero vectors
+        cosine = 1.0 if norm_orig < 1e-8 and norm_opt < 1e-8 else 0.0
+    else:
+        cosine = np.dot(orig_emb_1d, opt_emb_1d) / (norm_orig * norm_opt)
+
+    # L2 Norm Difference
+    l2_diff = np.linalg.norm(orig_emb_1d - opt_emb_1d)
+
+    # Mean Squared Error (MSE)
+    mse = np.mean((orig_emb_1d - opt_emb_1d) ** 2)
+
     return {
         'cosine': cosine,
-        'flipped_cosine': flipped_cosine,
-        'pcc': pcc,
         'l2_diff': l2_diff,
-        'mse': mse,
-        'spearman': spearman_corr
+        'mse': mse
     }
 
-def compute_centroid(orig_env, opt_env, common_keys):
-    """Compute centroid from 1D embeddings across all common keys"""
-    total_sum = None
-    count = 0
-    
-    with orig_env.begin() as orig_txn, opt_env.begin() as opt_txn:
-        for key in tqdm(common_keys, desc="Computing centroid"):
-            orig_emb = get_embedding(orig_txn, key)
-            opt_emb = get_embedding(opt_txn, key)
-            if orig_emb is None or opt_emb is None:
-                continue
-            if orig_emb.shape != opt_emb.shape:
-                print(f"Shape mismatch in {key}: {orig_emb.shape} vs {opt_emb.shape}")
-                continue
-            vec_sum = orig_emb + opt_emb
-            if total_sum is None:
-                total_sum = np.zeros_like(vec_sum)
-            total_sum += vec_sum
-            count += 2
-    
-    return total_sum / count if count else None
 
-def compute_all_metrics(orig_env, opt_env, common_keys, centroid):
-    """Compute metrics for each key and return a dictionary and the embedding matrices."""
-    metrics = {}
-    all_orig = []
-    all_opt = []
+def compute_all_residue_metrics(orig_env, opt_env, common_protein_keys):
+    """Computes metrics for each corresponding residue across all common proteins."""
+    all_residue_metrics = [] # List to store metric dicts for each residue pair
+    all_orig_residue_embs = []
+    all_opt_residue_embs = []
+    processed_protein_count = 0
+    processed_residue_count = 0
+    skipped_proteins = 0
+    skipped_residues = 0
+
+    # Load id_to_idx maps once
+    with orig_env.begin() as orig_txn, opt_env.begin() as opt_txn:
+        orig_id_map_bytes = orig_txn.get(b'id_to_idx')
+        opt_id_map_bytes = opt_txn.get(b'id_to_idx')
+        orig_id_map = pickle.loads(orig_id_map_bytes) if orig_id_map_bytes else None
+        opt_id_map = pickle.loads(opt_id_map_bytes) if opt_id_map_bytes else None
+        if orig_id_map is None or opt_id_map is None:
+             print("Warning: Could not load id_to_idx map from one or both DBs. Assuming common_keys are numeric LMDB keys.")
 
     with orig_env.begin() as orig_txn, opt_env.begin() as opt_txn:
-        for key in tqdm(common_keys, desc="Computing all metrics"):
-            orig_emb = get_embedding(orig_txn, key)
-            opt_emb = get_embedding(opt_txn, key)
-            if orig_emb is None or opt_emb is None:
-                continue
-            if orig_emb.shape != opt_emb.shape:
-                continue
-            met = compute_metrics(orig_emb, opt_emb, centroid)
-            metrics[key] = met
-            all_orig.append(orig_emb)
-            all_opt.append(opt_emb)
+        for protein_key in tqdm(common_protein_keys, desc="Computing residue metrics"):#
+            orig_data = get_protein_data(orig_txn, protein_key, orig_id_map)
+            opt_data = get_protein_data(opt_txn, protein_key, opt_id_map)
 
-    return metrics, np.stack(all_orig), np.stack(all_opt)
+            if orig_data is None or opt_data is None:
+                skipped_proteins += 1
+                continue # Skip protein if data retrieval failed for either
 
-def print_summary_statistics(metrics, metric_name):
-    """Print summary statistics for a given metric from the metrics dict."""
-    values = np.array([v[metric_name] for v in metrics.values()])
+            orig_embeddings = orig_data['embeddings'] # Should be (num_res, embed_dim)
+            opt_embeddings = opt_data['embeddings']
+
+            # Create residue identifier -> index map for both
+            orig_res_map = {(c, r): i for i, (c, r) in enumerate(zip(orig_data['chains'], orig_data['resids']))}
+            opt_res_map = {(c, r): i for i, (c, r) in enumerate(zip(opt_data['chains'], opt_data['resids']))}
+
+            common_residues = sorted(list(orig_res_map.keys() & opt_res_map.keys()))
+
+            if not common_residues:
+                # print(f"Warning: No common residues found for protein {protein_key}.")
+                skipped_proteins += 1 # Count as skipped if no residues overlap
+                continue
+
+            protein_processed_flag = False
+            for chain_resid_tuple in common_residues:
+                try:
+                    orig_idx = orig_res_map[chain_resid_tuple]
+                    opt_idx = opt_res_map[chain_resid_tuple]
+
+                    orig_emb_1d = orig_embeddings[orig_idx]
+                    opt_emb_1d = opt_embeddings[opt_idx]
+
+                    # Compute metrics for this residue pair
+                    residue_met = compute_residue_metrics(orig_emb_1d, opt_emb_1d)
+
+                    # Add identifiers to the metric dict
+                    residue_met['protein_id'] = protein_key
+                    residue_met['chain'] = chain_resid_tuple[0]
+                    residue_met['resid'] = chain_resid_tuple[1]
+
+                    all_residue_metrics.append(residue_met)
+
+                    # Collect aligned embeddings for global Procrustes/PCA
+                    all_orig_residue_embs.append(orig_emb_1d)
+                    all_opt_residue_embs.append(opt_emb_1d)
+                    processed_residue_count += 1
+                    protein_processed_flag = True
+
+                except Exception as e:
+                     print(f"Error processing residue {chain_resid_tuple} in protein {protein_key}: {e}")
+                     skipped_residues += 1
+
+            if protein_processed_flag:
+                 processed_protein_count += 1
+            else:
+                 # If we iterated common_residues but failed for all of them
+                 skipped_proteins += 1
+
+    print(f"Residue Metric Calculation Summary:")
+    print(f" Successfully processed proteins: {processed_protein_count}")
+    print(f" Total processed residue pairs: {processed_residue_count}")
+    print(f" Skipped proteins (data load fail or no common residues): {skipped_proteins}")
+    print(f" Skipped individual residues (error during metric calc): {skipped_residues}")
+
+    # Convert collected embeddings to large NumPy arrays
+    orig_residue_matrix = np.stack(all_orig_residue_embs) if all_orig_residue_embs else np.array([])
+    opt_residue_matrix = np.stack(all_opt_residue_embs) if all_opt_residue_embs else np.array([])
+
+    return all_residue_metrics, orig_residue_matrix, opt_residue_matrix
+
+def print_summary_statistics(residue_metrics_list, metric_name):
+    """Print summary statistics for a given metric from the list of residue metrics."""
+    # Filter out potential NaNs from failed metric calculations
+    values = np.array([m[metric_name] for m in residue_metrics_list if not np.isnan(m[metric_name])])
+
+    if values.size == 0:
+        print(f"Summary Statistics for {metric_name}: No valid data.")
+        return
+
     mean_val = np.mean(values)
     median_val = np.median(values)
     std_val = np.std(values)
     min_val = np.min(values)
     max_val = np.max(values)
-    
-    print(f"Summary Statistics for {metric_name}:")
-    print(f"Mean: {mean_val:.4f}")
-    print(f"Median: {median_val:.4f}")
-    print(f"Standard Deviation: {std_val:.4f}")
-    print(f"Min: {min_val:.4f}")
-    print(f"Max: {max_val:.4f}")
+    q25, q75 = np.percentile(values, [25, 75])
 
-def plot_similarity_distribution(opt_metrics, metric_name, output_dir, two_run_metrics=None):
-    """Generate an overlaid histogram for a given metric."""
-    opt_values = [v[metric_name] for v in opt_metrics.values()]
+    print(f"Summary Statistics for {metric_name} (across {len(values)} residues):")
+    print(f"  Mean:   {mean_val:.6f}")
+    print(f"  Median: {median_val:.6f}")
+    print(f"  Std Dev:{std_val:.6f}")
+    print(f"  Min:    {min_val:.6f}")
+    print(f"  Max:    {max_val:.6f}")
+    print(f"  25%:    {q25:.6f}")
+    print(f"  75%:    {q75:.6f}")
+
+def plot_similarity_distribution(residue_metrics_list, metric_name, output_dir):
+    """Generate a histogram for a given residue-level metric."""
+    # Filter out potential NaNs
+    values = [m[metric_name] for m in residue_metrics_list if not np.isnan(m[metric_name])]
+
+    if not values:
+        print(f"Cannot plot {metric_name}: No valid data.")
+        return
+
     plt.figure(figsize=(10, 6))
-    
-    if two_run_metrics is not None:
-        two_run_values = [v[metric_name] for v in two_run_metrics.values()]
-        plt.hist(opt_values, bins=50, alpha=0.7, color='blue', edgecolor='black', label='Optimized vs Original')
-        plt.hist(two_run_values, bins=50, alpha=0.3, color='red', edgecolor='black', label='Two Originals')
-    else:
-        plt.hist(opt_values, bins=50, alpha=0.75, color='steelblue', edgecolor='black', label='Optimized')
 
-    plt.title(f"{metric_name} Distribution")
+    plt.hist(values, bins=50, alpha=0.75, color='steelblue', edgecolor='black')
+
+    plt.title(f"Residue-Level {metric_name} Distribution")
     plt.xlabel(metric_name)
     plt.ylabel("Frequency")
     plt.grid(True)
-    plt.legend()
-    
-    hist_path = os.path.join(output_dir, f"{metric_name}_histogram.png")
+    # plt.legend() # No legend needed for single histogram
+
+    hist_path = os.path.join(output_dir, f"residue_{metric_name}_histogram.png")
     plt.savefig(hist_path)
     plt.close()
-    print(f"Histogram saved to {hist_path}")
+    print(f"Residue histogram saved to {hist_path}")
 
-# Sanity check functions remain unchanged
-def validate_self_similarity(env, keys):
-    with env.begin() as txn:
-        for key in keys[:5]:
-            emb = get_embedding(txn, key)
-            if emb is None:
-                continue
-            sim = np.dot(emb / np.linalg.norm(emb), emb / np.linalg.norm(emb))
-            if not np.isclose(sim, 1.0, atol=1e-6):
-                print(f"⚠️ Self-similarity failed for {key}: {sim:.4f}")
-            else:
-                print(f"✅ Self-similarity valid for {key}: {sim:.4f}")
-
-def validate_centroid(env, keys, centroid):
-    with env.begin() as txn:
-        emb_sum = np.zeros_like(centroid)
-        count = 0
-        for key in keys[:100]:
-            emb = get_embedding(txn, key)
-            if emb is not None:
-                emb_sum += emb
-                count += 1
-        calculated_centroid = emb_sum / count
-        diff = np.abs(centroid - calculated_centroid).mean()
-        print(f"Centroid validation - Mean difference: {diff:.2e}")
-
-def check_embedding_consistency(orig_env, opt_env, keys):
-    with orig_env.begin() as orig_txn, opt_env.begin() as opt_txn:
-        for key in keys[:5]:
-            orig = get_embedding(orig_txn, key)
-            opt = get_embedding(opt_txn, key)
-            if orig is None or opt is None:
-                continue
-            if not np.allclose(orig, opt, atol=1e-6):
-                print(f"⚠️ Embedding mismatch for {key}")
-            else:
-                print(f"✅ Embeddings identical for {key}")
+# Sanity check functions can be removed or adapted if needed for residue-level
+# e.g., check self-similarity for a few residues, but less critical now.
 
 def delete_files_in_directory(directory_path):
     try:
@@ -293,10 +359,10 @@ def delete_files_in_directory(directory_path):
                 if entry.is_file():
                     os.unlink(entry.path)
         print("Old output dir files deleted successfully.")
-    except OSError:
-        print("Error occurred while deleting files.")
+    except OSError as e:
+        print(f"Error occurred while deleting files: {e}")
 
-# --- NEW INSPECTION FUNCTION ---
+# --- NEW INSPECTION FUNCTION --- (Keep as is, useful for debugging LMDB structure)
 def inspect_first_embeddings(lmdb_dir, limit=5):
     """
     Inspects and prints the content of the first few data entries in an LMDB database.
@@ -307,12 +373,23 @@ def inspect_first_embeddings(lmdb_dir, limit=5):
     """
     print(f"\n--- Inspecting first {limit} data entries from {lmdb_dir} ---")
     inspected_count = 0
-    
+
     try:
         env = lmdb.open(lmdb_dir, readonly=True, lock=False)
     except lmdb.Error as e:
         print(f"Error opening LMDB {lmdb_dir}: {e}")
         return
+
+    # Get id_map if it exists
+    id_map = None
+    with env.begin() as txn:
+        id_map_bytes = txn.get(b'id_to_idx')
+        if id_map_bytes:
+            try:
+                id_map = pickle.loads(id_map_bytes)
+                print("  (Using id_to_idx map for inspection)")
+            except Exception as e:
+                print(f"  Warning: Failed to load id_to_idx map: {e}")
 
     with env.begin() as txn:
         cursor = txn.cursor()
@@ -321,43 +398,56 @@ def inspect_first_embeddings(lmdb_dir, limit=5):
                 break
 
             key = key_bytes.decode('utf-8')
-            
-            # Only process numeric keys which represent the data entries
-            if not key.isdigit():
-                print(f"  Skipping non-numeric key: {key}")
+
+            # Use the key directly if it's numeric OR if id_map is missing
+            if not key.isdigit() and id_map is not None:
+                # Skip non-numeric keys if we have an id_map (like num_examples)
+                # print(f"  Skipping non-data key: {key}")
                 continue
-                
-            print(f"\n--- Entry Key: {key} ---")
+
+            protein_id_label = key # Default label
+            if id_map:
+                # Find protein ID corresponding to this numeric key
+                found_id = None
+                for p_id, num_key_idx in id_map.items():
+                    if str(num_key_idx) == key:
+                        found_id = p_id
+                        break
+                if found_id:
+                    protein_id_label = f"{found_id} (LMDB key: {key})"
+                else:
+                    protein_id_label = f"Unknown Protein (LMDB key: {key})"
+
+
+            print(f"\n--- Entry: {protein_id_label} ---")
             try:
                 # Decompress and deserialize
                 data = pickle.loads(gzip.decompress(value))
-                
+
                 print(f"  Data Type: {type(data)}")
                 if isinstance(data, dict):
                     print("  Content:")
-                    # Use pprint for better readability of the dictionary
-                    # Limit embedding printing if it's large
+                    # Use pprint for better readability
                     data_to_print = {}
                     for k, v in data.items():
                         if k == 'embeddings' and isinstance(v, np.ndarray):
-                            data_to_print[k] = f"Numpy Array (shape: {v.shape}, dtype: {v.dtype}) - First few elements: {v.flatten()[:10]}..."
-                        elif isinstance(v, list) and len(v) > 10:
-                             data_to_print[k] = f"List (length: {len(v)}) - First 10: {v[:10]}..."
+                            data_to_print[k] = f"Numpy Array (shape: {v.shape}, dtype: {v.dtype}) - First 5: {v.flatten()[:5]}..."
+                        elif isinstance(v, list) and len(v) > 5:
+                             data_to_print[k] = f"List (len: {len(v)}) - First 5: {v[:5]}..."
                         else:
                              data_to_print[k] = v
                     pprint.pprint(data_to_print, indent=4)
                 else:
-                    # Fallback for non-dict data (shouldn't happen with current gen_embed)
                     print(f"  Content: {data}")
 
                 inspected_count += 1
 
             except gzip.BadGzipFile:
-                print(f"  Error decompressing value. Is it gzipped?")
+                print(f"  Error decompressing value for key {key}. Is it gzipped?")
             except pickle.UnpicklingError:
-                 print(f"  Error unpickling value.")
+                 print(f"  Error unpickling value for key {key}.")
             except Exception as e:
-                print(f"  Unexpected error during inspection: {e}")
+                print(f"  Unexpected error inspecting key {key}: {e}")
 
     env.close()
     if inspected_count == 0:
@@ -365,98 +455,108 @@ def inspect_first_embeddings(lmdb_dir, limit=5):
     print(f"\n--- Finished inspecting {inspected_count} entries ---")
 
 def main():
-    parser = argparse.ArgumentParser(description="Memory-efficient embedding comparison with additional metrics")
+    parser = argparse.ArgumentParser(description="Residue-level embedding comparison")
     parser.add_argument('--original', required=True, help="Original LMDB directory")
     parser.add_argument('--optimized', required=True, help="Optimized LMDB directory")
-    parser.add_argument('--out_dir', default="/home/users/ziyiw23/COLLAPSE/embed_eval_output", help="Output directory")
-    parser.add_argument('--second_ori', default=None, help="Second original LMDB directory for comparison")
-    parser.add_argument('--inspect', action='store_true', help="Inspect first few optimized embeddings data structure.")
+    parser.add_argument('--out_dir', default=OUTPUT_DIR, help="Output directory")
+    # Remove --second_ori argument as comparing two originals at residue level is less common
+    # parser.add_argument('--second_ori', default=None, help="Second original LMDB directory for comparison")
+    parser.add_argument('--inspect', action='store_true', help="Inspect first few embeddings data structure from both DBs.")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     delete_files_in_directory(args.out_dir)
-    
+
     if args.inspect:
-        inspect_first_embeddings(args.optimized, limit=5)
+        inspect_first_embeddings(args.original, limit=3)
+        inspect_first_embeddings(args.optimized, limit=3)
         print("\nInspection complete. Continuing with comparison...")
-    
-    common_keys = get_common_diff_keys(args.original, args.optimized, args.out_dir)
-    if not common_keys:
-        print("No common keys found!")
-        return
-    
-    orig_env = lmdb.open(args.original, readonly=True, lock=False)
-    opt_env = lmdb.open(args.optimized, readonly=True, lock=False)
-    
-    centroid = compute_centroid(orig_env, opt_env, common_keys)
-    if centroid is None:
-        print("Failed to compute centroid")
+
+    common_protein_keys = get_common_diff_keys(args.original, args.optimized, args.out_dir)
+    if not common_protein_keys:
+        print("No common protein keys found! Exiting.")
         return
 
-    print("\nComputing All Metrics...")
-    metrics, orig_mat, opt_mat = compute_all_metrics(orig_env, opt_env, common_keys, centroid)
+    orig_env = lmdb.open(args.original, readonly=True, lock=False, readahead=False) # Disable readahead for potentially better random access
+    opt_env = lmdb.open(args.optimized, readonly=True, lock=False, readahead=False)
+
+    print("\nComputing All Residue Metrics...")
+    # This function now returns residue metrics list, and the aligned residue matrices
+    residue_metrics, orig_residue_mat, opt_residue_mat = compute_all_residue_metrics(orig_env, opt_env, common_protein_keys)
+
+    orig_env.close() # Close environments after computation
     opt_env.close()
 
-    # Compute global Procrustes once over all embeddings
-    mtx1, mtx2, global_disparity = procrustes(orig_mat, opt_mat)
+    if not residue_metrics or orig_residue_mat.size == 0:
+         print("No valid residue pairs found for comparison. Exiting.")
+         return
 
-    print(""" 
-  ____  __ __  __  __  __  __   ____  _____ __  __   
- (_ (_`|  |  ||  \/  ||  \/  | / () \ | () )\ \/ /   
-.__)__) \___/ |_|\/|_||_|\/|_|/__/\__\|_|\_\ |__|    
-    """)
+    # Compute global Procrustes on the residue matrices
+    print("\nPerforming Global Procrustes Analysis on Residue Embeddings...")
+    mtx1, mtx2, global_disparity = procrustes(orig_residue_mat, opt_residue_mat)
 
-    # Print summary statistics for each metric
+    print("""
+______ _____ _____ _   _ _    _____ 
+| ___ \  ___/  ___| | | | |  |_   _|
+| |_/ / |__ \ `--.| | | | |    | |  
+|    /|  __| `--. \ | | | |    | |  
+| |\ \| |___/\__/ / |_| | |____| |  
+\_| \_\____/\____/ \___/\_____/\_/  
+""")
+
+    # Print summary statistics for each residue-level metric
     for metric in eval_metrics:
-        print(f"\n=== Summary for {metric} ===")
-        print_summary_statistics(metrics, metric)
-    print(f"✅ Global Procrustes disparity: {global_disparity:.6f}")
+        print(f"\n=== Summary for Residue-Level {metric} ===")
+        print_summary_statistics(residue_metrics, metric)
+    print(f"\n✅ Global Residue Procrustes disparity: {global_disparity:.6f}")
 
-    # Plot similarity distributions
-    second_metrics = None
-    if args.second_ori is not None:
-        second_orig_env = lmdb.open(args.second_ori, readonly=True, lock=False)
-        second_common_keys = get_common_diff_keys(args.original, args.second_ori, args.out_dir)
-        centroid_sec = compute_centroid(orig_env, second_orig_env, second_common_keys)
-        second_metrics, _, _ = compute_all_metrics(orig_env, second_orig_env, second_common_keys, centroid_sec)
-        second_orig_env.close()
-        print(""" 
-  ____  __ __  __  __  __  __   ____  _____ __  __   
- (_ (_`|  |  ||  \/  ||  \/  | / () \ | () )\ \/ /   
-.__)__) \___/ |_|\/|_||_|\/|_|/__/\__\|_|\_\ |__|    
-        """)
-        for metric in eval_metrics:
-            print(f"\n=== Summary for {metric} (second original) ===")
-            print_summary_statistics(second_metrics, metric)
-    orig_env.close()
-    
+    # Plot residue-level similarity distributions
     for metric in eval_metrics:
-        print(f"\n⏳ Plotting {metric} Distribution")
-        plot_similarity_distribution(metrics, metric, args.out_dir, two_run_metrics=second_metrics)
-    
-    # Visualize global alignment using PCA
-    from sklearn.decomposition import PCA
-    pca = PCA(n_components=2)
-    proj1 = pca.fit_transform(mtx1)
-    proj2 = pca.transform(mtx2)
-    plt.figure(figsize=(10, 6))
-    plt.scatter(proj1[:, 0], proj1[:, 1], label="Original", alpha=0.5)
-    plt.scatter(proj2[:, 0], proj2[:, 1], label="Optimized (aligned)", alpha=0.5)
-    plt.legend()
-    plt.title("Global Embedding Alignment after Procrustes")
-    pca_path = os.path.join(args.out_dir, "Procrustes_alignment.png")
-    plt.savefig(pca_path)
-    plt.close()
-    print(f"\n✅ PCA alignment visualization saved to {pca_path}")
-    
-    output_path = os.path.join(args.out_dir, "all_metrics.pkl")
-    with open(output_path, 'wb') as f:
-        pickle.dump(metrics, f)
-    print(f"✅ All metrics saved to {output_path}")
+        print(f"\n⏳ Plotting Residue-Level {metric} Distribution")
+        plot_similarity_distribution(residue_metrics, metric, args.out_dir)
+
+    # Visualize global alignment using PCA on Procrustes-aligned residue embeddings
+    print("\n⏳ Generating PCA plot of aligned residue embeddings...")
+    try:
+        n_components_pca = min(DEFAULT_PCA_COMPONENTS, mtx1.shape[0], mtx1.shape[1]) # Adjust components if fewer residues/dims
+        if n_components_pca < 2:
+            print(" Not enough data points or dimensions for 2D PCA plot.")
+        else:
+            pca = PCA(n_components=n_components_pca)
+            proj1 = pca.fit_transform(mtx1) # Fit on original aligned
+            proj2 = pca.transform(mtx2)     # Transform optimized aligned
+            
+            # Sample points for plotting if too many residues
+            num_residues_to_plot = min(len(proj1), DEFAULT_N_SAMPLES)
+            indices = np.random.choice(len(proj1), num_residues_to_plot, replace=False)
+            
+            plt.figure(figsize=(12, 8))
+            plt.scatter(proj1[indices, 0], proj1[indices, 1], label="Original Residues (Aligned)", alpha=0.5, s=10)
+            plt.scatter(proj2[indices, 0], proj2[indices, 1], label="Optimized Residues (Aligned)", alpha=0.5, s=10)
+            plt.legend()
+            plt.title(f"Residue Embedding Alignment after Procrustes (PCA, {num_residues_to_plot} samples)")
+            plt.xlabel("PC1")
+            plt.ylabel("PC2")
+            plt.grid(True)
+            pca_path = os.path.join(args.out_dir, "Residue_Procrustes_PCA_alignment.png")
+            plt.savefig(pca_path)
+            plt.close()
+            print(f"✅ PCA alignment visualization saved to {pca_path}")
+    except Exception as pca_e:
+        print(f"Error during PCA visualization: {pca_e}")
+
+    # Save all residue metrics to a file (e.g., CSV for easier analysis)
+    try:
+        metrics_df = pd.DataFrame(residue_metrics)
+        output_path = os.path.join(args.out_dir, "all_residue_metrics.csv")
+        metrics_df.to_csv(output_path, index=False)
+        print(f"✅ All residue metrics saved to {output_path}")
+    except Exception as save_e:
+        print(f"Error saving residue metrics to CSV: {save_e}")
 
 if __name__ == "__main__":
     import time
     start_time = time.time()
     main()
     end_time = time.time()
-    print(f"✅ Evaluation completed in {end_time - start_time:.2f} seconds.")
+    print(f"\n✅ Evaluation completed in {end_time - start_time:.2f} seconds.")

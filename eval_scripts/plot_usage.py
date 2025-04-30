@@ -7,8 +7,8 @@ import re
 from datetime import datetime, timedelta
 
 # --- Configuration ---
-gpu_log_file = './logs/gpu_usage_64119179.csv'
-sar_log_file = './logs/cpu_mem_usage_64119179.log'
+gpu_log_file = './logs/gpu_usage.csv'
+sar_log_file = './logs/cpu_mem_usage.log'
 output_plot_file = './logs/resource_usage_plot.png'
 
 # --- GPU Log Parsing ---
@@ -85,14 +85,14 @@ try:
         if current_time_dt is None: continue
 
         # Check for per-CPU line (output from `sar -P ALL -u`)
-        if len(parts) >= 10 and (parts[2].isdigit() or parts[2] == 'all'):
+        if len(parts) >= 9 and (parts[2].isdigit() or parts[2] == 'all'):
             cpu_id_str = parts[2]
             try:
                 user = float(parts[3])
-                system = float(parts[5]) # Note: %system is often the 6th field (index 5)
-                iowait = float(parts[6])
-                idle = float(parts[9]) # Note: %idle is often the 10th field (index 9)
-                total_util = user + system # A common way to calculate active %
+                system = float(parts[5]) # %system is index 5
+                iowait = float(parts[6]) # %iowait is index 6
+                idle = float(parts[8])   # %idle is index 8
+                total_util = user + system # Calculate active utilization
 
                 cpu_record = {
                     'timestamp': current_time_dt, '%user': user, '%system': system,
@@ -106,9 +106,11 @@ try:
                  print(f"  Problematic line parts: {parts}")
                  pass
         # Check for memory line (output from `sar -r`) - keep logic even if not plotting
-        elif len(parts) >= 10 and parts[1].replace('.', '', 1).isdigit():
+        elif len(parts) >= 4 and parts[1].replace('.', '', 1).isdigit(): # Example: Adjust check for memory line structure
              try:
-                 memused_gb = float(parts[2]) / (1024**2) # kbmemused is usually 3rd field (index 2)
+                 # Assuming kbmemused is field 3 (index 2) in `sar -r` output
+                 # Modify indices based on actual `sar -r` output if you use this
+                 memused_gb = float(parts[2]) / (1024**2)
                  mem_data.append({'timestamp': current_time_dt, 'memused_gb': memused_gb})
              except (ValueError, IndexError, TypeError) as e:
                  print(f"Debug SAR Parse Error (Memory line): {e}")

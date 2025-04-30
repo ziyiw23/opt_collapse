@@ -321,7 +321,7 @@ def extract_env_from_resid(df, ch_resid, env_radius=10.0, res_df=None, ca_center
     
     graph = transform(df_env)
     
-    return graph
+    return graph, res_df
 
 def extract_env_from_coords(df, center, env_radius=10.0):
     df = df.reset_index()
