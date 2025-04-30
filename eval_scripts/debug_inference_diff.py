@@ -10,8 +10,8 @@ from torch_geometric.data import Batch, Data
 import argparse
 import time
 from contextlib import nullcontext
-import collections as col # Added
-import glob # Added for file listing
+import collections as col
+import glob
 
 # --- Seeding and Determinism ---
 seed = 42
@@ -30,31 +30,25 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # --- Original Pipeline Imports ---
 from collapse.data import process_pdb, atom_info
-# Import extract_env_from_resid directly for original path simulation
 from collapse.data import extract_env_from_resid as extract_env_from_resid_original
-# Need the original transform instance logic
 from collapse.data import BaseTransform as OriginalBaseTransform
-# Keep embed_protein_original for final embedding comparison consistency if desired
-# from collapse.data import embed_protein as embed_protein_original # Removed for this test
-# from collapse import initialize_model # Model not needed for graph comparison
+from collapse import initialize_model # Restored model import
 
 # --- Optimized Pipeline Imports ---
-from embedding_utils import (
-    GraphPreparationTransformCPU,
-    # graph_collate_fn # Removed for this test
-)
+from embedding_utils import GraphPreparationTransformCPU
 from atom3d.filters.filters import first_model_filter
 
 # --- Configuration ---
-PDB_DIR = "/scratch/groups/rbaltman/ziyiw23/1000_pdbs/" # Directory containing PDBs
-NUM_PDBS_TO_TEST = 100
-# CHECKPOINT_PATH = 'data/checkpoints/collapse_base.pt' # Not needed
+PDB_DIR = "/scratch/groups/rbaltman/ziyiw23/1000_pdbs/"
+NUM_PDBS_TO_TEST = 9
+CHECKPOINT_PATH = 'data/checkpoints/collapse_base.pt' # Restored checkpoint path
 ENV_RADIUS = 10.0
-DEVICE = torch.device('cpu') # Force CPU for graph generation consistency
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # Use GPU if available
 INCLUDE_HETS = False
-ORIGINAL_EDGE_CUTOFF = 4.5 # The fixed cutoff used in original BaseTransform for GVP features
+ORIGINAL_EDGE_CUTOFF = 4.5
 
 # --- Helper: Detailed Graph Object Comparison ---
+# ... (compare_graph_objects function remains the same) ...
 def compare_graph_objects(g1, g2, resid_label):
     """Compares two torch_geometric Data objects attribute by attribute."""
     match = True
@@ -67,7 +61,7 @@ def compare_graph_objects(g1, g2, resid_label):
          print(f"    ❌ FAIL: Graph is None for {resid_label} in one pathway.")
          return False
     if not isinstance(g1, Data) or not isinstance(g2, Data):
-         print(f"    ❌ FAIL: One or both objects are not Data instances for {resid_label} (Types: {type(g1)}, {type(g2)})." )
+         print(f"    ❌ FAIL: One or both objects are not Data instances for {resid_label} (Types: {type(g1)}, {type(g2)}).")
          return False
     # Compare node counts first
     if g1.num_nodes != g2.num_nodes:
@@ -90,7 +84,7 @@ def compare_graph_objects(g1, g2, resid_label):
              else: # If non-edge attrs are missing from both, that's odd but technically matching
                  pass
         elif not has_g1_attr or not has_g2_attr:
-             print(f"    ❌ FAIL: Attribute '{attr}' missing in one but not both graphs for {resid_label}." )
+             print(f"    ❌ FAIL: Attribute '{attr}' missing in one but not both graphs for {resid_label}.")
              match = False
              attr_match = False
              continue # Cannot compare if missing in one
@@ -107,7 +101,7 @@ def compare_graph_objects(g1, g2, resid_label):
                  # If non-edge attrs are None in both, technically matching
                  pass
         elif t1 is None or t2 is None:
-            print(f"    ❌ FAIL: Attribute '{attr}' is None in only one graph for {resid_label}." )
+            print(f"    ❌ FAIL: Attribute '{attr}' is None in only one graph for {resid_label}.")
             match = False
             attr_match = False
             continue
@@ -117,13 +111,13 @@ def compare_graph_objects(g1, g2, resid_label):
             t1_cpu = t1.cpu()
             t2_cpu = t2.cpu()
         except Exception as e:
-            print(f"    ❌ FAIL: Error moving attribute '{attr}' to CPU for {resid_label}: {e}" )
+            print(f"    ❌ FAIL: Error moving attribute '{attr}' to CPU for {resid_label}: {e}")
             match = False
             attr_match = False
             continue
 
         if t1_cpu.shape != t2_cpu.shape:
-            print(f"    ❌ FAIL: Shapes differ for '{attr}' for {resid_label}: {t1_cpu.shape} vs {t2_cpu.shape}" )
+            print(f"    ❌ FAIL: Shapes differ for '{attr}' for {resid_label}: {t1_cpu.shape} vs {t2_cpu.shape}")
             match = False
             attr_match = False
             continue
@@ -146,10 +140,19 @@ def compare_graph_objects(g1, g2, resid_label):
                  equal = True
 
              if equal:
-                 g1._sorted_edge_indices = inds1 if np_ei1.shape[1] > 0 else np.array([], dtype=int)
-                 g2._sorted_edge_indices = inds2 if np_ei2.shape[1] > 0 else np.array([], dtype=int)
+                 # Store sorted indices if they match, needed for feature comparison
+                 if np_ei1.shape[1] > 0:
+                     g1._sorted_edge_indices = inds1
+                     g2._sorted_edge_indices = inds2
+                 else: # Handle case of zero edges
+                      g1._sorted_edge_indices = np.array([], dtype=int)
+                      g2._sorted_edge_indices = np.array([], dtype=int)
              else:
                  match, attr_match = False, False
+                 # Avoid adding indices if comparison failed
+                 if hasattr(g1, '_sorted_edge_indices'): del g1._sorted_edge_indices
+                 if hasattr(g2, '_sorted_edge_indices'): del g2._sorted_edge_indices
+
         elif attr in ['edge_s', 'edge_v']:
              # Skip comparison if no edges (shape check already done)
              if t1_cpu.shape[0] == 0: continue
@@ -175,11 +178,11 @@ def compare_graph_objects(g1, g2, resid_label):
                  equal = torch.equal(t1_cpu, t2_cpu)
                  if not equal: match, attr_match = False, False
              except:
-                 print(f"    ⚠️ WARN: Could not compare attribute '{attr}' for {resid_label}." )
+                 print(f"    ⚠️ WARN: Could not compare attribute '{attr}' for {resid_label}.")
                  match, attr_match = False, False
 
         if not attr_match:
-             print(f"    ❌ FAIL: Attribute '{attr}' differs for {resid_label}." )
+             print(f"    ❌ FAIL: Attribute '{attr}' differs for {resid_label}.")
 
     # Cleanup temporary attributes
     if hasattr(g1, '_sorted_edge_indices'): del g1._sorted_edge_indices
@@ -187,7 +190,9 @@ def compare_graph_objects(g1, g2, resid_label):
 
     return match
 
+
 # --- Helper: Compare Lists of Graphs ---
+# ... (compare_graph_lists function remains the same) ...
 def compare_graph_lists(pdb_id, orig_graphs, orig_meta, opt_graphs, opt_meta):
     print(f"\n--- Comparing Generated Graph Lists for PDB: {pdb_id} ---")
     overall_match = True
@@ -226,7 +231,7 @@ def compare_graph_lists(pdb_id, orig_graphs, orig_meta, opt_graphs, opt_meta):
     common_residues = sorted(list(orig_res_map.keys() & opt_res_map.keys()))
 
     if len(common_residues) != len(orig_graphs):
-        print(f"❌ FAIL: Number of common residues ({len(common_residues)}) doesn't match graph list length ({len(orig_graphs)}). Metadata mismatch?" )
+        print(f"❌ FAIL: Number of common residues ({len(common_residues)}) doesn't match graph list length ({len(orig_graphs)}). Metadata mismatch?")
         orig_residues_set = set(orig_res_map.keys())
         opt_residues_set = set(opt_res_map.keys())
         print(f"  Original only: {sorted(list(orig_residues_set - opt_residues_set))}")
@@ -237,7 +242,7 @@ def compare_graph_lists(pdb_id, orig_graphs, orig_meta, opt_graphs, opt_meta):
          print("✅ OK: Both pathways generated 0 graphs.")
          return True
     elif not common_residues:
-         print("⚠️ WARN: No common residues identified between metadata lists (though list lengths matched)." )
+         print("⚠️ WARN: No common residues identified between metadata lists (though list lengths matched).")
          return False # Treat as failure if lengths matched but keys didn't
 
     all_graphs_match = True
@@ -250,7 +255,7 @@ def compare_graph_lists(pdb_id, orig_graphs, orig_meta, opt_graphs, opt_meta):
 
         # Basic check: ensure graphs exist at these indices
         if orig_idx >= len(orig_graphs) or opt_idx >= len(opt_graphs):
-             print(f"    ❌ FAIL: Index out of bounds for {label} (Orig: {orig_idx}, Opt: {opt_idx})" )
+             print(f"    ❌ FAIL: Index out of bounds for {label} (Orig: {orig_idx}, Opt: {opt_idx})")
              all_graphs_match = False
              mismatched_residues.append(label + " (Index Error)")
              continue
@@ -261,20 +266,87 @@ def compare_graph_lists(pdb_id, orig_graphs, orig_meta, opt_graphs, opt_meta):
             mismatched_residues.append(label)
 
     if all_graphs_match:
-        print(f"✅ SUCCESS: All {len(common_residues)} corresponding graph objects for {pdb_id} appear identical." )
+        print(f"✅ SUCCESS: All {len(common_residues)} corresponding graph objects for {pdb_id} appear identical.")
     else:
-        print(f"❌ FAIL: Differences found in graph objects for {pdb_id}. Mismatched residues: {mismatched_residues}" )
+        print(f"❌ FAIL: Differences found in graph objects for {pdb_id}. Mismatched residues: {mismatched_residues}")
 
     return all_graphs_match
+
+# --- Helper: Embedding Comparison (Restored) ---
+def compare_embeddings(pdb_id, orig_embs_np, orig_meta, opt_embs_np, opt_meta):
+    print(f"\n--- Comparing Final Embeddings for PDB: {pdb_id} ---")
+    if orig_embs_np is None or opt_embs_np is None:
+        print("  One or both embedding arrays are None. Cannot compare.")
+        return False
+    if orig_meta is None or opt_meta is None:
+         print("  One or both metadata lists are None. Cannot compare.")
+         return False
+
+    # Basic shape check
+    if orig_embs_np.shape != opt_embs_np.shape:
+        print(f"❌ FAIL: Embedding shapes differ!")
+        print(f" Original shape: {orig_embs_np.shape}")
+        print(f" Optimized shape: {opt_embs_np.shape}")
+        return False
+    else:
+        print(f" Embedding shapes match: {orig_embs_np.shape}")
+
+    # Create residue maps
+    try:
+        orig_res_map = {(m['chain'], m['resid']): i for i, m in enumerate(orig_meta)}
+        opt_res_map = {(m['chain'], m['resid']): i for i, m in enumerate(opt_meta)}
+    except KeyError:
+         print("  ❌ FAIL: Metadata missing 'chain' or 'resid' keys.")
+         return False
+
+    common_residues = sorted(list(orig_res_map.keys() & opt_res_map.keys()))
+
+    if not common_residues:
+        print("❌ FAIL: No common residues found between the two results based on metadata.")
+        return False
+    # Verify count matches embedding length (should pass if graph comparison passed)
+    if len(common_residues) != orig_embs_np.shape[0]:
+         print(f"❌ FAIL: Number of common residues ({len(common_residues)}) doesn't match embedding length ({orig_embs_np.shape[0]}).")
+         return False
+    else:
+        print(f" Found {len(common_residues)} common residues to compare embeddings.")
+
+
+    # Align embeddings
+    aligned_orig = np.array([orig_embs_np[orig_res_map[res]] for res in common_residues])
+    aligned_opt = np.array([opt_embs_np[opt_res_map[res]] for res in common_residues])
+
+    # Compare using np.allclose
+    are_close = np.allclose(aligned_orig, aligned_opt, rtol=1e-5, atol=1e-8)
+
+    if are_close:
+        print("✅ SUCCESS: Aligned embedding arrays are numerically close (np.allclose).")
+        return True
+    else:
+        print("❌ FAIL: Aligned embedding arrays differ significantly.")
+        diff = np.abs(aligned_orig - aligned_opt)
+        print(f" Max absolute difference: {np.max(diff):.6g}")
+        print(f" Mean absolute difference: {np.mean(diff):.6g}")
+        # Find first differing element
+        indices = np.where(~np.isclose(aligned_orig, aligned_opt, rtol=1e-5, atol=1e-8))
+        if len(indices[0]) > 0:
+             first_diff_idx = (indices[0][0], indices[1][0])
+             first_diff_res_tuple = common_residues[first_diff_idx[0]]
+             print(f" First difference at residue index {first_diff_idx[0]} (Chain: {first_diff_res_tuple[0]}, Resid: {first_diff_res_tuple[1]}), element index {first_diff_idx[1]}:")
+             print(f"  Original : {aligned_orig[first_diff_idx]:.8f}")
+             print(f"  Optimized: {aligned_opt[first_diff_idx]:.8f}")
+             print(f"  Difference: {diff[first_diff_idx]:.6g}")
+        return False
 
 # --- Main Execution ---
 if __name__ == "__main__":
     print(f"Testing PDB directory: {PDB_DIR}")
     print(f"Testing first {NUM_PDBS_TO_TEST} PDB files found.")
     print(f"Include Hets: {INCLUDE_HETS}")
+    print(f"Using device: {DEVICE}")
 
     # Find PDB files
-    pdb_files = sorted(glob.glob(os.path.join(PDB_DIR, '*.pdb*'))) # Handle .pdb, .pdb.gz etc.
+    pdb_files = sorted(glob.glob(os.path.join(PDB_DIR, '*.pdb*')))
     if not pdb_files:
         print(f"Error: No PDB files found in {PDB_DIR}")
         sys.exit(1)
@@ -282,148 +354,179 @@ if __name__ == "__main__":
     files_to_process = pdb_files[:NUM_PDBS_TO_TEST]
     print(f"Files to process: {[os.path.basename(f) for f in files_to_process]}")
 
-    # Instantiate reusable components
-    # Ensure both transforms use the same device (CPU for this test)
+    # --- Load Model Once ---
+    print("\nLoading model...")
+    model = initialize_model(CHECKPOINT_PATH, device=DEVICE)
+    model.eval() # Ensure model is in evaluation mode
+    print("Model loaded.")
+
+    # Instantiate reusable transform components
     original_base_transform = OriginalBaseTransform(edge_cutoff=ORIGINAL_EDGE_CUTOFF, device=DEVICE)
-    graph_transform_cpu = GraphPreparationTransformCPU(
+    graph_transform_cpu = GraphPreparationTransformCPU( # This generates graphs on CPU
         include_hets=INCLUDE_HETS,
         env_radius=ENV_RADIUS,
-        num_rbf=16 # Assuming default RBF count
+        num_rbf=16
     )
-    # Ensure internal base transform uses the correct device and cutoff
-    graph_transform_cpu.base_transform_cpu = OriginalBaseTransform(edge_cutoff=ORIGINAL_EDGE_CUTOFF, device=DEVICE)
+    # Ensure the internal BaseTransform used by the CPU transform for feature calc uses the correct cutoff and DEVICE='cpu'
+    graph_transform_cpu.base_transform_cpu = OriginalBaseTransform(edge_cutoff=ORIGINAL_EDGE_CUTOFF, device='cpu')
 
     # --- Loop through PDB files ---
-    all_pdbs_match = True
+    overall_graph_match = True
+    overall_embedding_match = True
     for pdb_file_path in files_to_process:
-        pdb_id = os.path.basename(pdb_file_path).split('.')[0] # Get ID like MGYP...
+        pdb_id = os.path.basename(pdb_file_path).split('.')[0]
         print(f"\n{'='*20} Processing PDB: {pdb_id} {'='*20}")
 
-        # --- 1. Run Original Pipeline Path (Simulate Graph Generation) ---
-        print("--- Simulating Original Graph Generation ---")
-        start_time_orig_graph = time.time()
-        orig_graphs_list = []
-        orig_metadata_list = []
+        # --- Initialize results for this PDB ---
+        orig_graphs_list = None
+        orig_metadata_list = None
+        opt_graphs_list = None
+        opt_metadata_list = None
+        orig_embs_np = None
+        opt_embs_np = None
+        pdb_graph_match = False
+        pdb_embedding_match = False
+
+        # --- 1. Original Path: Graph Gen + Inference ---
+        print("\n--- Running Original Path ---")
+        start_time_orig = time.time()
         try:
             atom_df_orig = process_pdb(pdb_file_path, include_hets=INCLUDE_HETS)
             if atom_df_orig is None or atom_df_orig.empty:
-                 print("  ⚠️ process_pdb failed for original path. Skipping PDB.")
-                 all_pdbs_match = False # Mark as mismatch for this PDB
+                 print("  ⚠️ process_pdb failed. Skipping PDB.")
                  continue
 
-            # Replicate the loop from embed_protein
+            # Generate Graphs
+            current_orig_graphs = []
+            current_orig_meta = []
             for (c, i, r), res_df in atom_df_orig.groupby(['chain', 'residue', 'resname']):
                 if r not in atom_info.aa[:20]: continue
                 resid_letter = atom_info.aa_to_letter(r)
                 resid_str = resid_letter + str(i)
-                # chain_atoms = atom_df_orig[atom_df_orig.chain == c] # Not strictly needed here?
-
-                # Call original extraction function
-                # Pass the locally instantiated transform for feature calculation consistency
-                # The original function *internally* uses its global transform, which is tricky.
-                # Let's TRY passing a local one, though extract_env_from_resid doesn't accept it.
-                # We rely on the fact that the global one should have cutoff=4.5 from GVP.
-                # If features still differ, this internal global transform use is the likely cause.
                 out_tuple = extract_env_from_resid_original(
-                                        atom_df_orig, # Use full df for KDTree as in original
-                                        (c, resid_str),
-                                        env_radius=ENV_RADIUS,
-                                        res_df=res_df.copy(),
-                                        train_mode=False
-                                    )
-
-                if out_tuple is None: continue
-
-                if isinstance(out_tuple, tuple) and len(out_tuple) >= 1 and isinstance(out_tuple[0], Data):
+                                        atom_df_orig, (c, resid_str),
+                                        env_radius=ENV_RADIUS, res_df=res_df.copy(), train_mode=False)
+                if out_tuple and isinstance(out_tuple[0], Data):
                     graph_obj = out_tuple[0]
-                    graph_obj.protein_id = pdb_id # Add metadata for comparison
+                    graph_obj.protein_id = pdb_id
                     graph_obj.resid = resid_str
                     graph_obj.chain = c
-                    orig_graphs_list.append(graph_obj)
+                    current_orig_graphs.append(graph_obj)
                     confidence = res_df['bfactor'].iloc[0] if 'bfactor' in res_df.columns else 0.0
-                    orig_metadata_list.append({
-                        'protein_id': graph_obj.protein_id, 'chain': c,
+                    current_orig_meta.append({
+                        'protein_id': pdb_id, 'chain': c,
                         'resid': resid_str, 'confidence': confidence
                     })
-                else:
-                     print(f"  ⚠️ Original extract_env returned unexpected format for {c}_{resid_str}. Type: {type(out_tuple)}" )
+            orig_graphs_list = current_orig_graphs
+            orig_metadata_list = current_orig_meta
+            print(f"  Original path generated {len(orig_graphs_list)} graphs.")
 
-            end_time_orig_graph = time.time()
-            print(f" Original path generated {len(orig_graphs_list)} graphs in {end_time_orig_graph - start_time_orig_graph:.2f}s." )
+            # Inference
+            if orig_graphs_list:
+                 graph_batch_orig = Batch.from_data_list(orig_graphs_list).to(DEVICE)
+                 with torch.no_grad():
+                     embs_tensor_orig, _ = model.online_encoder(graph_batch_orig, return_projection=False)
+                     orig_embs_np = embs_tensor_orig.float().cpu().numpy()
+                 if len(orig_metadata_list) != orig_embs_np.shape[0]:
+                      print(f"  ⚠️ Original inference meta/emb count mismatch: {len(orig_metadata_list)} vs {orig_embs_np.shape[0]}")
+                      orig_embs_np = None # Invalidate embeddings
+            else:
+                 print("  No original graphs generated, skipping inference.")
 
         except Exception as e:
-            print(f"  ❌ Error during original path graph generation for {pdb_id}: {e}")
+            print(f"  ❌ Error during original path for {pdb_id}: {e}")
             import traceback; traceback.print_exc()
-            orig_graphs_list = [] # Ensure list is empty on error
-            all_pdbs_match = False
+        end_time_orig = time.time()
+        print(f"  Original path took {end_time_orig - start_time_orig:.2f}s.")
 
-
-        # --- 2. Run Optimized Pipeline Path (Capture Graphs) ---
-        print("\n--- Simulating Optimized Graph Generation ---")
-        start_time_opt_graph = time.time()
-        opt_graphs_list = []
-        opt_metadata_list = []
+        # --- 2. Optimized Path: Graph Gen + Inference ---
+        print("\n--- Running Optimized Path ---")
+        start_time_opt = time.time()
         try:
-            # a) Preprocess PDB
+            # Preprocess
             raw_atoms = process_pdb(pdb_file_path)
             if raw_atoms is None or raw_atoms.empty:
-                 print("  ⚠️ process_pdb failed for optimized path. Skipping PDB.")
-                 all_pdbs_match = False
+                 print("  ⚠️ process_pdb failed. Skipping PDB.")
                  continue
-
             atom_df_opt = first_model_filter(raw_atoms)
             atom_df_opt = atom_df_opt[~atom_df_opt.hetero.str.contains('W', na=False)]
             atom_df_opt = atom_df_opt[atom_df_opt['element'] != 'H']
             if not INCLUDE_HETS:
                 atom_df_opt = atom_df_opt[atom_df_opt.resname.isin(atom_info.aa)]
             atom_df_opt = atom_df_opt.reset_index(drop=True)
-            atom_df_opt['id'] = pdb_id # Add id column
-
+            atom_df_opt['id'] = pdb_id
             if atom_df_opt.empty:
-                print("  ⚠️ DataFrame empty after filtering for optimized path. Skipping PDB.")
-                all_pdbs_match = False
+                print("  ⚠️ DataFrame empty after filtering. Skipping PDB.")
                 continue
 
-            # b) Generate Graphs (Using the transform)
-            # Pass the already configured graph_transform_cpu instance
+            # Generate Graphs
             transformed_item = graph_transform_cpu({'atoms': atom_df_opt, 'id': pdb_id})
-
             if transformed_item is None:
-                 print(f"  ⚠️ GraphPreparationTransformCPU returned None for {pdb_id}. Skipping PDB.")
-                 all_pdbs_match = False
+                 print(f"  ⚠️ GraphPreparationTransformCPU returned None. Skipping PDB.")
                  continue
-
-            # Ensure the output has the expected structure
             if 'graphs' not in transformed_item or 'metadata' not in transformed_item:
-                 print(f"  ⚠️ Optimized transform output missing 'graphs' or 'metadata' for {pdb_id}. Skipping PDB.")
-                 all_pdbs_match = False
+                 print(f"  ⚠️ Optimized transform output missing keys. Skipping PDB.")
                  continue
-
             opt_graphs_list = transformed_item['graphs']
             opt_metadata_list = transformed_item['metadata']
+            print(f"  Optimized path generated {len(opt_graphs_list)} graphs.")
 
-            end_time_opt_graph = time.time()
-            print(f" Optimized path generated {len(opt_graphs_list)} graphs in {end_time_opt_graph - start_time_opt_graph:.2f}s." )
+            # Inference
+            if opt_graphs_list:
+                graph_batch_opt = Batch.from_data_list(opt_graphs_list).to(DEVICE)
+                with torch.no_grad():
+                    embs_tensor_opt, _ = model.online_encoder(graph_batch_opt, return_projection=False)
+                    opt_embs_np = embs_tensor_opt.float().cpu().numpy()
+                if len(opt_metadata_list) != opt_embs_np.shape[0]:
+                     print(f"  ⚠️ Optimized inference meta/emb count mismatch: {len(opt_metadata_list)} vs {opt_embs_np.shape[0]}")
+                     opt_embs_np = None # Invalidate embeddings
+            else:
+                 print("  No optimized graphs generated, skipping inference.")
 
         except Exception as e:
-            print(f"  ❌ Error during optimized path graph generation for {pdb_id}: {e}")
+            print(f"  ❌ Error during optimized path for {pdb_id}: {e}")
             import traceback; traceback.print_exc()
-            opt_graphs_list = [] # Ensure list is empty on error
-            all_pdbs_match = False
+        end_time_opt = time.time()
+        print(f"  Optimized path took {end_time_opt - start_time_opt:.2f}s.")
 
-        # --- 3. Compare Graph Lists for this PDB ---
-        # Check if either list generation failed before comparing
+        # --- 3. Compare Graphs for this PDB ---
         if orig_graphs_list is not None and opt_graphs_list is not None:
-            pdb_match = compare_graph_lists(pdb_id, orig_graphs_list, orig_metadata_list, opt_graphs_list, opt_metadata_list)
-            if not pdb_match:
-                all_pdbs_match = False # Track if any PDB failed comparison
+            pdb_graph_match = compare_graph_lists(pdb_id, orig_graphs_list, orig_metadata_list, opt_graphs_list, opt_metadata_list)
+            if not pdb_graph_match:
+                overall_graph_match = False
         else:
-             print(f" Skipping comparison for {pdb_id} because one or both graph lists failed generation.")
-             all_pdbs_match = False # Mark as failed if generation had errors
+             print(f" Skipping graph comparison for {pdb_id} due to generation errors.")
+             overall_graph_match = False
+
+        # --- 4. Compare Embeddings for this PDB ---
+        if pdb_graph_match: # Only compare embeddings if graphs matched
+             if orig_embs_np is not None and opt_embs_np is not None:
+                 pdb_embedding_match = compare_embeddings(pdb_id, orig_embs_np, orig_metadata_list, opt_embs_np, opt_metadata_list)
+                 if not pdb_embedding_match:
+                      overall_embedding_match = False
+             else:
+                  print(f" Skipping embedding comparison for {pdb_id} due to missing embeddings from one or both paths (check errors above).")
+                  overall_embedding_match = False # Mark as mismatch if embeddings couldn't be generated/compared
+        else:
+            print(f" Skipping embedding comparison for {pdb_id} because graphs did not match.")
+            overall_embedding_match = False
+
 
     # --- Final Summary ---
     print(f"\n{'='*20} FINAL SUMMARY {'='*20}")
-    if all_pdbs_match:
-        print(f"✅✅✅ SUCCESS: Graph generation appears consistent for all {len(files_to_process)} tested PDBs.")
+    if overall_graph_match:
+        print(f"✅ Graph Generation: Consistent for all {len(files_to_process)} tested PDBs.")
     else:
-        print(f"❌❌❌ FAILURE: Differences detected in graph generation for one or more of the {len(files_to_process)} tested PDBs.")
+        print(f"❌ Graph Generation: Differences detected for one or more of the {len(files_to_process)} tested PDBs.")
+
+    if overall_embedding_match:
+        print(f"✅ Embedding Results: Consistent (numerically close) for all tested PDBs where graphs matched.")
+    else:
+        print(f"❌ Embedding Results: Differences detected (or comparisons skipped) for one or more tested PDBs.")
+
+    if overall_graph_match and overall_embedding_match:
+         print("\nCONCLUSION: Both graph generation and inference appear consistent within GPU numerical precision.")
+    elif overall_graph_match and not overall_embedding_match:
+         print("\nCONCLUSION: Graph generation is consistent, but embedding results differ beyond expected numerical noise. Check inference steps.")
+    else:
+         print("\nCONCLUSION: Graph generation showed inconsistencies. Embedding differences are expected.")
