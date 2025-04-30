@@ -47,7 +47,7 @@ echo "Final NUM_GPUS value: $NUM_GPUS"
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES" 
 
 echo "Running $SCRIPT using python3 (Single GPU: cuda:0 equivalent)..."
-python3 -m cProfile -o $PROFILE_OUT "$SCRIPT" "$DATA_IN" "$DATA_OUT" --filetype pdb --num_workers 9
+python3 -m cProfile -o $PROFILE_OUT "$SCRIPT" "$DATA_IN" "$DATA_OUT" --filetype pdb --num_workers 9 --compile_model
 
 echo "Script execution complete."
 echo "Stopping monitoring processes..."

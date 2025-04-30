@@ -169,11 +169,10 @@ def _run_inference_and_collect(model, dataloader, device, batch_size):
 
             with torch.no_grad():
                 # Use autocast for potential speedup on CUDA with float16 support
-                # with torch.autocast(device_type=str(device.type), dtype=torch.float16, enabled=(str(device.type) == 'cuda')):
-                # --- Autocast disabled --- 
-                embs, _ = model.online_encoder(graph_batch_gpu, return_projection=False)
-                final_embs_np = embs.float().cpu().numpy() # Move back to CPU, ensure float32
-                # processed_residue_count += final_embs_np.shape[0] # Count moved to after validation
+                with torch.autocast(device_type=str(device.type), dtype=torch.float16, enabled=(str(device.type) == 'cuda')):
+                    embs, _ = model.online_encoder(graph_batch_gpu, return_projection=False)
+                    final_embs_np = embs.float().cpu().numpy() # Move back to CPU, ensure float32
+                    # processed_residue_count += final_embs_np.shape[0] # Count moved to after validation
 
             # Clear GPU memory quickly after successful inference
             del graph_batch_gpu, embs
@@ -247,10 +246,9 @@ def _run_inference_and_collect(model, dataloader, device, batch_size):
                     try:
                         chunk_batch = Batch.from_data_list(chunk_graphs).to(device)
                         with torch.no_grad():
-                            # with torch.autocast(device_type=str(device.type), dtype=torch.float16, enabled=(str(device.type) == 'cuda')):
-                            # --- Autocast disabled --- 
-                            chunk_embs, _ = model.online_encoder(chunk_batch, return_projection=False)
-                            protein_embeddings_list.append(chunk_embs.float().cpu().numpy())
+                            with torch.autocast(device_type=str(device.type), dtype=torch.float16, enabled=(str(device.type) == 'cuda')):
+                                chunk_embs, _ = model.online_encoder(chunk_batch, return_projection=False)
+                                protein_embeddings_list.append(chunk_embs.float().cpu().numpy())
                         del chunk_batch, chunk_embs
                         # Minimal clearing inside chunk loop if memory is extremely tight
                         # if str(device) != 'cpu': torch.cuda.empty_cache()
@@ -322,23 +320,23 @@ def _run_inference_and_collect(model, dataloader, device, batch_size):
                      # else: print(f"Warning: Fallback embedding element not np array for {protein_id}")
 
             # Check if we have a valid 2D array and if dimensions match metadata
-            if embedding_array is not None: # Outer if
-                 num_meta_items = len(data.get('resids', []))
-                 if num_meta_items == embedding_array.shape[0]: # Inner if (Success case)
+            if embedding_array is not None:
+                num_meta_items = len(data.get('resids', []))
+                if num_meta_items == embedding_array.shape[0]:
                       data['embeddings'] = embedding_array # Replace list with final array
                       results_to_save.append({'id': protein_id, **data})
                       processed_protein_count += 1
                       processed_residue_count += embedding_array.shape[0] # Count successful residues
-                 else: # Inner else (validation mismatch)
-                      print(f"\nFinal validation mismatch for {protein_id}. Meta count ({num_meta_items}) != Embeddings dim 0 ({embedding_array.shape[0]}). Skipping protein.")
-                      # Avoid double counting failures from OOM fallback
-                      if not data.get('pooling_type', []) or 'chunked_oom_fallback' not in data.get('pooling_type', []):
+                else:
+                    print(f"\nFinal validation mismatch for {protein_id}. Meta count ({num_meta_items}) != Embeddings dim 0 ({embedding_array.shape[0]}). Skipping protein.")
+                    # Avoid double counting failures from OOM fallback
+                    if not data.get('pooling_type', []) or 'chunked_oom_fallback' not in data.get('pooling_type', []):
                            failed_protein_count += 1
-            else: # Outer else (embedding_array is None)
-                 # Could not create valid embedding_array (e.g., stacking error, initial list empty)
-                 # print(f"\nWarning: Could not obtain valid final embedding array for {protein_id}. Skipping protein.")
-                 if not data.get('pooling_type', []) or 'chunked_oom_fallback' not in data.get('pooling_type', []):
-                      failed_protein_count += 1 # Count failure only if not already counted during OOM fail
+                    else:
+                        print(f"\nFinal validation mismatch for {protein_id}. Meta count ({num_meta_items}) != Embeddings dim 0 ({embedding_array.shape[0]}). Skipping protein.")
+                        # Avoid double counting failures from OOM fallback
+                        if not data.get('pooling_type', []) or 'chunked_oom_fallback' not in data.get('pooling_type', []):
+                            failed_protein_count += 1 # Count failure only if not already counted during OOM fail
 
 # --- End Main Loop ---
     loop_end_time = time.time()

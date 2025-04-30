@@ -215,7 +215,7 @@ def embed_protein(atom_df, model, device='cpu', include_hets=True, env_radius=10
         out = extract_env_from_resid(chain_atoms, (c, resid), env_radius, res_df.copy(), train_mode=False)
         if out is None:
             continue
-        graphs.append(out)
+        graphs.append(out[0])
         emb_data['resids'].append(resid)
         confidence = res_df['bfactor'].iloc[0]  # for AlphaFold pLDDT
         emb_data['confidence'].append(confidence)
@@ -259,7 +259,7 @@ def embed_pocket(atom_df, pocket_resids, model, device='cpu', include_hets=True,
         out = extract_env_from_resid(chain_atoms, (c, resid), env_radius, res_df.copy(), train_mode=False)
         if out is None:
             continue
-        graphs.append(out)
+        graphs.append(out[0])
         emb_data['resids'].append(resid)
         confidence = res_df['bfactor'].iloc[0]  # for AlphaFold pLDDT
         emb_data['confidence'].append(confidence)

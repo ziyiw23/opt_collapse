@@ -466,32 +466,31 @@ class GraphPreparationTransformCPU:
 
         except Exception as e:
             print(f"Worker skipping {protein_id} due to preprocessing error: {e}")
-            # import traceback; traceback.print_exc() # Uncomment for detailed trace
+            # import traceback; traceback.print_exc() 
             return None
         # --- End Preprocessing ---
 
         # --- Prepare Graphs ---
         try:
             graphs, metadata = prepare_graphs_for_protein_cpu(
-                atom_df=atom_df, # Pass the filtered df
-                include_hets=self.include_hets, # Pass flag (though filtering done above)
+                atom_df=atom_df, 
+                include_hets=self.include_hets,
                 env_radius=self.env_radius,
-                base_transform_cpu=self.base_transform_cpu # Pass the instantiated transform
+                base_transform_cpu=self.base_transform_cpu
             )
 
             if not graphs:
                 # print(f"Worker: No graphs generated for {protein_id}.") # Debug
                 return None
 
-            # Return dict format expected by collate function
             result = {'graphs': graphs, 'metadata': metadata, 'id': protein_id}
             if label is not None:
-                 result['label'] = label # Keep label if it existed
+                 result['label'] = label
             return result
 
         except Exception as e:
              print(f"Worker error during graph preparation for {protein_id}: {e}")
-             import traceback; traceback.print_exc() # Print detailed trace for this error
+             import traceback; traceback.print_exc()
              return None
         # --- End Graph Preparation ---
 
@@ -513,7 +512,7 @@ class TransformedDatasetWrapper(Dataset):
              raise TypeError("transform_cpu must be callable")
 
         self.base_dataset = base_dataset
-        self.transform = transform_cpu # Store the transform instance
+        self.transform = transform_cpu
 
     def __len__(self):
         return len(self.base_dataset)
@@ -522,25 +521,19 @@ class TransformedDatasetWrapper(Dataset):
         """Loads raw item and applies the transform."""
         try:
             raw_item = self.base_dataset[idx]
-            # Handle cases where the base dataset might return None
             if raw_item is None:
-                 # print(f"Debug: Base dataset returned None for index {idx}") # Optional debug
                  return None
         except IndexError:
              print(f"Error: Index {idx} out of bounds for base dataset.")
-             return None # Or re-raise? Returning None might be safer for DataLoader.
+             return None
         except Exception as load_e:
-            # Log error loading from base dataset
             print(f"Error loading RAW item {idx} from base dataset: {load_e}")
             return None
 
-        # Apply the stored transform instance to the raw item
         try:
             transformed_item = self.transform(raw_item)
-            # transform should return None on failure
             return transformed_item
         except Exception as transform_e:
-            # Catch unexpected errors during the transform call itself
             protein_id = raw_item.get('id', f'index_{idx}') if isinstance(raw_item, dict) else f'index_{idx}'
             print(f"Unexpected error during transform application for {protein_id} (idx {idx}): {transform_e}")
             import traceback; traceback.print_exc()
