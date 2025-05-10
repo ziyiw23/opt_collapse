@@ -92,19 +92,14 @@ class BaseTransform:
 
                 if coords.dim() == 1: coords = coords.unsqueeze(0)
                 if coords.shape[0] == 0:
-                    # print(f"DEBUG BaseTransform ({protein_id}): Exiting because coords shape[0] is 0.") # DEBUG
                     return None
 
                 edge_index = torch_cluster.radius_graph(
                     coords,
-                    r=self.edge_cutoff,
-                    batch=None, # No batching within a single structure's transform
-                    loop=False, # Match original pipeline behavior
-                    flow='source_to_target'
+                    r=self.edge_cutoff
                 )
 
                 if edge_index.shape[1] == 0:
-                    # print(f"DEBUG BaseTransform ({protein_id}): Exiting because edge_index shape[1] is 0.") # DEBUG
                     return None
 
                 edge_s, edge_v = _edge_features(coords, edge_index, D_max=self.edge_cutoff,
@@ -415,9 +410,8 @@ class GraphPreparationTransformCPU:
         self.num_rbf = num_rbf
         # BaseTransform is instantiated here, potentially within each worker process.
         # Ensure device is 'cpu' for worker-based execution.
-        self.base_transform_cpu = BaseTransform(edge_cutoff=self.env_radius,
-                                                num_rbf=self.num_rbf,
-                                                device='cpu') # Explicitly CPU
+        self.base_transform_cpu = BaseTransform(num_rbf=self.num_rbf,
+                                                device='cpu')
 
     def __call__(self, elem):
         """ Processes one raw element (e.g., dict from ATOM3D dataset) """
@@ -483,7 +477,14 @@ class GraphPreparationTransformCPU:
                 # print(f"Worker: No graphs generated for {protein_id}.") # Debug
                 return None
 
-            result = {'graphs': graphs, 'metadata': metadata, 'id': protein_id}
+            # Add atoms and file_path to the result
+            result = {
+                'graphs': graphs,
+                'metadata': metadata,
+                'id': protein_id,
+                'atoms': atom_df, # Add the processed atom dataframe
+                'file_path': elem.get('file_path') # Add the original filepath if present
+            }
             if label is not None:
                  result['label'] = label
             return result
@@ -546,7 +547,8 @@ def graph_collate_fn(batch):
     Custom collate function for DataLoader.
     Filters out None items (failed transforms) and batches valid graph data.
     Expects input `batch` to be a list of outputs from GraphPreparationTransformCPU
-    (dicts containing 'graphs', 'metadata', 'id', optionally 'label').
+    (dicts containing 'graphs', 'metadata', 'id', 'atoms', 'file_path').
+    Returns exactly 4 items: batched_graph, aggregated_metadata, atoms_map, filepath_map.
     """
     # 1. Filter out None items (representing failed transformations)
     valid_items = [item for item in batch if isinstance(item, dict)]
@@ -555,25 +557,27 @@ def graph_collate_fn(batch):
     if not valid_items:
         return None # Signal to the training loop to skip this batch
 
-    # 2. Aggregate graphs and metadata from valid items
+    # 2. Aggregate graphs, metadata, atoms, and filepaths from valid items
     all_graphs = []
     all_metadata = []
-    original_ids = []
-    labels = [] # Store labels if present
-    has_labels = 'label' in valid_items[0] # Check if first item has label
+    atoms_map = {}
+    filepath_map = {}
 
     for item in valid_items:
         # Basic validation of item structure
+        item_id = item.get('id', 'unknown')
         if 'graphs' in item and 'metadata' in item and item['graphs']:
             all_graphs.extend(item['graphs'])
             all_metadata.extend(item['metadata'])
-            original_ids.append(item.get('id', 'unknown'))
-            if has_labels:
-                 labels.append(item.get('label')) # Append label, potentially None if missing
+            # Store atoms and filepath, handling potential None values
+            atoms_data = item.get('atoms')
+            if atoms_data is not None: # Only store if atoms data exists
+                atoms_map[item_id] = atoms_data
+            filepath_map[item_id] = item.get('file_path') # Store filepath (can be None)
         else:
             # Log if a non-None item has unexpected structure
-            item_id = item.get('id', 'unknown')
             # print(f"Warning: Collate received invalid item structure for {item_id}. Keys: {item.keys()}")
+            pass # Continue processing other valid items
 
     # If aggregation resulted in no graphs (e.g., all valid items had empty graph lists)
     if not all_graphs:
@@ -586,15 +590,11 @@ def graph_collate_fn(batch):
         # Catch potential errors during batching (e.g., inconsistent Data objects)
         print(f"Error during Batch.from_data_list: {e}")
         # Try to identify which proteins might have caused the issue
-        problematic_ids = list(set(m.get('protein_id', item_id) for item_id, m_list in zip(original_ids, all_metadata) for m in m_list))
+        problematic_ids = list(set(m.get('protein_id', item.get('id', 'unknown'))
+                               for item in valid_items if item.get('metadata')
+                               for m in item['metadata']))
         print(f"Potentially problematic IDs in batch leading to collation error: {problematic_ids}")
         return None # Signal failure for this batch
 
-    # 4. Return the batch graph and aggregated metadata (and labels if applicable)
-    if has_labels:
-         # Convert labels to tensor or appropriate format if needed
-         # Handle potential Nones if some items lacked labels
-         # Example: return final_graph_batch, all_metadata, torch.tensor(labels) if all(l is not None for l in labels) else labels
-         return final_graph_batch, all_metadata, labels # Returning list of labels for flexibility
-    else:
-         return final_graph_batch, all_metadata 
+    # 4. Return exactly 4 items as expected by the calling script
+    return final_graph_batch, all_metadata, atoms_map, filepath_map

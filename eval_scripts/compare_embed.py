@@ -210,10 +210,10 @@ def compute_residue_metrics(orig_emb_1d, opt_emb_1d):
         'mse': mse
     }
 
-
-def compute_all_residue_metrics(orig_env, opt_env, common_protein_keys):
-    """Computes metrics for each corresponding residue across all common proteins."""
-    all_residue_metrics = [] # List to store metric dicts for each residue pair
+def compute_protein_and_residue_metrics(orig_env, opt_env, common_protein_keys):
+    """Computes metrics at both residue and average protein levels."""
+    all_residue_metrics = []
+    all_protein_metrics = []
     all_orig_residue_embs = []
     all_opt_residue_embs = []
     processed_protein_count = 0
@@ -231,74 +231,81 @@ def compute_all_residue_metrics(orig_env, opt_env, common_protein_keys):
              print("Warning: Could not load id_to_idx map from one or both DBs. Assuming common_keys are numeric LMDB keys.")
 
     with orig_env.begin() as orig_txn, opt_env.begin() as opt_txn:
-        for protein_key in tqdm(common_protein_keys, desc="Computing residue metrics"):#
+        for protein_key in tqdm(common_protein_keys, desc="Computing Protein & Residue Metrics"):
             orig_data = get_protein_data(orig_txn, protein_key, orig_id_map)
             opt_data = get_protein_data(opt_txn, protein_key, opt_id_map)
 
             if orig_data is None or opt_data is None:
                 skipped_proteins += 1
-                continue # Skip protein if data retrieval failed for either
+                continue # Skip protein if data retrieval failed
 
-            orig_embeddings = orig_data['embeddings'] # Should be (num_res, embed_dim)
+            orig_embeddings = orig_data['embeddings'] # (num_res, embed_dim)
             opt_embeddings = opt_data['embeddings']
-
-            # Create residue identifier -> index map for both
-            orig_res_map = {(c, r): i for i, (c, r) in enumerate(zip(orig_data['chains'], orig_data['resids']))}
-            opt_res_map = {(c, r): i for i, (c, r) in enumerate(zip(opt_data['chains'], opt_data['resids']))}
-
-            common_residues = sorted(list(orig_res_map.keys() & opt_res_map.keys()))
-
-            if not common_residues:
-                # print(f"Warning: No common residues found for protein {protein_key}.")
-                skipped_proteins += 1 # Count as skipped if no residues overlap
-                continue
-
+            
             protein_processed_flag = False
-            for chain_resid_tuple in common_residues:
-                try:
-                    orig_idx = orig_res_map[chain_resid_tuple]
-                    opt_idx = opt_res_map[chain_resid_tuple]
-
-                    orig_emb_1d = orig_embeddings[orig_idx]
-                    opt_emb_1d = opt_embeddings[opt_idx]
-
-                    # Compute metrics for this residue pair
-                    residue_met = compute_residue_metrics(orig_emb_1d, opt_emb_1d)
-
-                    # Add identifiers to the metric dict
-                    residue_met['protein_id'] = protein_key
-                    residue_met['chain'] = chain_resid_tuple[0]
-                    residue_met['resid'] = chain_resid_tuple[1]
-
-                    all_residue_metrics.append(residue_met)
-
-                    # Collect aligned embeddings for global Procrustes/PCA
-                    all_orig_residue_embs.append(orig_emb_1d)
-                    all_opt_residue_embs.append(opt_emb_1d)
-                    processed_residue_count += 1
-                    protein_processed_flag = True
-
-                except Exception as e:
-                     print(f"Error processing residue {chain_resid_tuple} in protein {protein_key}: {e}")
-                     skipped_residues += 1
-
-            if protein_processed_flag:
-                 processed_protein_count += 1
+            # --- Protein Level Comparison ---
+            if orig_embeddings.shape[0] > 0 and opt_embeddings.shape[0] > 0:
+                orig_avg_emb = orig_embeddings.mean(axis=0)
+                opt_avg_emb = opt_embeddings.mean(axis=0)
+                protein_met = compute_residue_metrics(orig_avg_emb, opt_avg_emb) # Reuse function
+                protein_met['protein_id'] = protein_key
+                all_protein_metrics.append(protein_met)
+                protein_processed_flag = True # Mark as processed if avg comparison done
             else:
-                 # If we iterated common_residues but failed for all of them
-                 skipped_proteins += 1
+                # If embeddings are empty for one, skip protein-level comparison for this PDB
+                pass
+            
+            # --- Residue Level Comparison (Only if protein level was attempted or successful) ---
+            if protein_processed_flag: # Only proceed if average could be calculated
+                orig_res_map = {(c, r): i for i, (c, r) in enumerate(zip(orig_data['chains'], orig_data['resids']))}
+                opt_res_map = {(c, r): i for i, (c, r) in enumerate(zip(opt_data['chains'], opt_data['resids']))}
+                common_residues = sorted(list(orig_res_map.keys() & opt_res_map.keys()))
 
-    print(f"Residue Metric Calculation Summary:")
-    print(f" Successfully processed proteins: {processed_protein_count}")
+                if not common_residues:
+                    # This protein might have embeddings but no *common* residues identified
+                    pass # Don't count as skipped protein again, just no residue metrics
+                else:
+                    residues_processed_this_protein = 0
+                    for chain_resid_tuple in common_residues:
+                        try:
+                            orig_idx = orig_res_map[chain_resid_tuple]
+                            opt_idx = opt_res_map[chain_resid_tuple]
+                            orig_emb_1d = orig_embeddings[orig_idx]
+                            opt_emb_1d = opt_embeddings[opt_idx]
+                            residue_met = compute_residue_metrics(orig_emb_1d, opt_emb_1d)
+                            residue_met['protein_id'] = protein_key
+                            residue_met['chain'] = chain_resid_tuple[0]
+                            residue_met['resid'] = chain_resid_tuple[1]
+                            all_residue_metrics.append(residue_met)
+                            all_orig_residue_embs.append(orig_emb_1d)
+                            all_opt_residue_embs.append(opt_emb_1d)
+                            residues_processed_this_protein += 1
+                        except Exception as e:
+                             print(f"Error processing residue {chain_resid_tuple} in protein {protein_key}: {e}")
+                             skipped_residues += 1
+                    
+                    if residues_processed_this_protein > 0:
+                        processed_residue_count += residues_processed_this_protein
+                    else: 
+                        # If common residues existed but all failed processing
+                        pass # Don't mark protein as skipped again if avg worked
+                        
+            # Increment processed protein count if *any* comparison was done (avg or residue)
+            if protein_processed_flag:
+                processed_protein_count += 1
+            else: # Only mark as skipped if protein failed both avg and residue stage prep
+                skipped_proteins += 1
+
+    print(f"\nMetric Calculation Summary:")
+    print(f" Successfully processed proteins (Avg and/or Residue): {processed_protein_count}")
     print(f" Total processed residue pairs: {processed_residue_count}")
-    print(f" Skipped proteins (data load fail or no common residues): {skipped_proteins}")
+    print(f" Skipped proteins (data load fail): {skipped_proteins}")
     print(f" Skipped individual residues (error during metric calc): {skipped_residues}")
 
-    # Convert collected embeddings to large NumPy arrays
     orig_residue_matrix = np.stack(all_orig_residue_embs) if all_orig_residue_embs else np.array([])
     opt_residue_matrix = np.stack(all_opt_residue_embs) if all_opt_residue_embs else np.array([])
 
-    return all_residue_metrics, orig_residue_matrix, opt_residue_matrix
+    return all_residue_metrics, orig_residue_matrix, opt_residue_matrix, all_protein_metrics
 
 def print_summary_statistics(residue_metrics_list, metric_name):
     """Print summary statistics for a given metric from the list of residue metrics."""
@@ -482,7 +489,7 @@ def main():
 
     print("\nComputing All Residue Metrics...")
     # This function now returns residue metrics list, and the aligned residue matrices
-    residue_metrics, orig_residue_mat, opt_residue_mat = compute_all_residue_metrics(orig_env, opt_env, common_protein_keys)
+    residue_metrics, orig_residue_mat, opt_residue_mat, protein_metrics = compute_protein_and_residue_metrics(orig_env, opt_env, common_protein_keys)
 
     orig_env.close() # Close environments after computation
     opt_env.close()
@@ -553,6 +560,41 @@ ______ _____ _____ _   _ _    _____
         print(f"✅ All residue metrics saved to {output_path}")
     except Exception as save_e:
         print(f"Error saving residue metrics to CSV: {save_e}")
+
+    # --- Process Protein-Level Results --- ## NEW SECTION ##
+    print(f"\n{ '='*10 } Protein-Level Comparison { '='*10 }")
+    if not protein_metrics:
+        print("No valid protein-level metrics to analyze.")
+    else:
+        # Print summary statistics for each protein-level metric
+        for metric in eval_metrics:
+            print(f"\n=== Summary for Protein-Level {metric} ===")
+            # Reuse the same summary function
+            print_summary_statistics(protein_metrics, metric)
+
+        # Plot protein-level similarity distributions
+        for metric in eval_metrics:
+            print(f"\n⏳ Plotting Protein-Level {metric} Distribution")
+            # Reuse the same plotting function, changing the title/filename slightly
+            plot_similarity_distribution(protein_metrics, metric, args.out_dir)
+            # Rename the generated file to distinguish it
+            old_hist_path = os.path.join(args.out_dir, f"residue_{metric}_histogram.png")
+            new_hist_path = os.path.join(args.out_dir, f"protein_{metric}_histogram.png")
+            try:
+                if os.path.exists(old_hist_path):
+                     os.rename(old_hist_path, new_hist_path)
+                     print(f"Protein histogram saved to {new_hist_path}")
+            except OSError as rename_e:
+                 print(f"Error renaming histogram file for protein {metric}: {rename_e}")
+
+        # Save all protein metrics to a file
+        try:
+            protein_metrics_df = pd.DataFrame(protein_metrics)
+            output_path = os.path.join(args.out_dir, "all_protein_metrics.csv")
+            protein_metrics_df.to_csv(output_path, index=False)
+            print(f"✅ All protein metrics saved to {output_path}")
+        except Exception as save_e:
+            print(f"Error saving protein metrics to CSV: {save_e}")
 
 if __name__ == "__main__":
     import time

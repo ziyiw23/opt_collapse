@@ -7,12 +7,12 @@ from atom3d.datasets import load_dataset
 import collections as col
 from collapse.utils import pdb_from_fname
 from collapse import initialize_model
+import re
+from torch_geometric.data import Batch
 
 # Import original transform
 from collapse.data import EmbedTransform as OriginalEmbedTransform
-# Import components needed for the optimized path
-from embedding_utils import GraphPreparationTransformCPU # The CPU preprocessing transform
-from torch_geometric.data import Batch # To batch graphs for the model
+from embedding_utils import GraphPreparationTransformCPU
 
 parser = argparse.ArgumentParser()
 parser.add_argument('pdb', type=str, nargs='+')
@@ -27,9 +27,6 @@ parser.add_argument('--filetype', type=str, default='pdb')
 parser.add_argument('--verbose', action='store_true')
 parser.add_argument('--include_hets', action='store_true')
 parser.add_argument('--debug', action='store_true', help='Run only on first 5 PDBs for quick debugging')
-# Add arguments to match gen_embed.py defaults, allowing override
-parser.add_argument('--env_radius', type=float, default=10.0, help="Environment radius for graph construction")
-parser.add_argument('--max_neighbors', type=int, default=32, help="Max neighbors for radius graph")
 
 args = parser.parse_args()
 
@@ -56,8 +53,13 @@ with open('data/background_stats/combined_background.pkl', 'rb') as f:
 model = initialize_model(args.checkpoint, device=device)
 model.eval()
 
-# Load raw dataset - transform will be applied conditionally inside the loop
-dataset = load_dataset(args.pdb, args.filetype, transform=None) 
+if args.mode == 'original':
+    transform = OriginalEmbedTransform(model, include_hets=args.include_hets, device=device)
+else: # Optimized mode only prepares graphs here
+    transform = GraphPreparationTransformCPU(include_hets=args.include_hets)
+
+# Load dataset - transform is either OriginalEmbedTransform or GraphPreparationTransformCPU
+dataset = load_dataset(args.pdb, args.filetype, transform=transform)
 
 if args.debug:
     from torch.utils.data import Subset
@@ -66,145 +68,162 @@ if args.debug:
 
 db_pdbcodes = np.array([p[:4] for p in db_pdbs])
 
-# After loading database
-print("\nDatabase statistics:")
-print(f"- Number of embeddings: {len(db_embeddings)}")
-print(f"- Embedding dimension: {db_embeddings.shape[1]}")
-print(f"- Number of unique sites: {len(set(db_labels))}")
-print(f"- Cutoff value: {cutoff}")
+for data_from_loader in dataset:
+    if data_from_loader is None:
+        print("⚠️ Skipping failed transform/prep (None)")
+        continue
 
-for raw_pdb_data in dataset:
-    if raw_pdb_data is None: 
-        print("⚠️ Skipping entry: Raw data is None.")
-        continue
-        
-    # Check if essential keys are present
-    if 'id' not in raw_pdb_data or 'atoms' not in raw_pdb_data:
-        print(f"⚠️ Skipping entry: Missing 'id' or 'atoms' key in raw data: {raw_pdb_data.get('id', 'Unknown ID')}")
-        continue
-        
-    pdb_id, af_flag = pdb_from_fname(raw_pdb_data["id"])
-    print(f'\nProcessing Input PDB: {pdb_id}')
-    
-    processed_pdb_data = None # Initialize variable to hold processed data
-    
-    # --- Conditional Processing based on Mode --- 
+    # ADDED: Conditional processing based on mode
     if args.mode == 'original':
-        print(f"  Using original embedding mode...")
-        try:
-            transform = OriginalEmbedTransform(model, include_hets=args.include_hets, device=device)
-            processed_pdb_data = transform(raw_pdb_data)
-            if processed_pdb_data is None:
-                print(f"  ⚠️ Original transform failed for {pdb_id}.")
-        except Exception as e:
-             print(f"  ⚠️ Error during original transform for {pdb_id}: {e}")
-             processed_pdb_data = None 
-             
-    elif args.mode == 'optimized':
-        print(f"  Using optimized embedding mode (replicating gen_embed logic)...")
-        try:
-            # 1. Prepare Graphs on CPU using the transform from embedding_utils
-            graph_transform_cpu = GraphPreparationTransformCPU(
-                include_hets=args.include_hets, 
-                env_radius=args.env_radius,      # Pass the argument
-                max_neighbors=args.max_neighbors # Pass the argument
-            )
-            # graph_transform_cpu expects a dict like raw_pdb_data
-            prepared_data = graph_transform_cpu(raw_pdb_data)
+        # Original mode output is already the final dictionary
+        pdb_data = data_from_loader
+    else: # Optimized mode - data_from_loader is the output of GraphPreparationTransformCPU
+        processed_data = data_from_loader # Rename for clarity within this block
+        if not isinstance(processed_data, dict) or 'graphs' not in processed_data or not processed_data.get('graphs'):
+            pdb_id_err = processed_data.get('id', 'unknown') if isinstance(processed_data, dict) else 'unknown'
+            print(f"⚠️ Skipping {pdb_id_err}: Invalid output from GraphPreparationTransformCPU.")
+            continue
 
-            if prepared_data is None or not prepared_data.get('graphs'):
-                print(f"  ⚠️ Graph preparation failed or yielded no graphs for {pdb_id}.")
-                processed_pdb_data = None
+        graphs = processed_data['graphs']
+        metadata = processed_data['metadata']
+        pdb_id_from_prep = processed_data['id']
+
+        if not graphs: # Redundant check, but safe
+             print(f"⚠️ Skipping {pdb_id_from_prep}: No graphs generated.")
+             continue
+
+        # Batch graphs and run model
+        embeddings_np = None # Initialize
+        try:
+            graph_batch_gpu = Batch.from_data_list(graphs).to(device)
+            with torch.no_grad():
+                 # Use autocast for potential performance gains on CUDA
+                 with torch.autocast(device_type=str(device.type), dtype=torch.float16, enabled=(str(device.type) == 'cuda')):
+                      # Assuming model.online_network exists and works like in gen_embed
+                      embeddings_tensor = model.online_network(graph_batch_gpu)
+                      embeddings_np = embeddings_tensor.float().cpu().numpy()
+
+            del graph_batch_gpu # Clean up memory
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"❌ Error during model inference for {pdb_id_from_prep}: {e}")
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            continue # Skip this protein
+
+        if embeddings_np is None: # Check if inference failed
+            print(f"❌ Skipping {pdb_id_from_prep} due to inference failure.")
+            continue
+
+        if len(metadata) != embeddings_np.shape[0]:
+            print(f"❌ Mismatch between metadata ({len(metadata)}) and embeddings ({embeddings_np.shape[0]}) for {pdb_id_from_prep}. Skipping.")
+            continue
+
+        # Reconstruct the pdb_data dictionary
+        resids_list = []
+        chains_list = []
+        confidence_list = []
+        parsing_failed = False
+        for i, meta in enumerate(metadata):
+            match = re.match(r"([A-Za-z_]*)(\d+)", meta.get('resid', ''))
+            if match:
+                 resnum_str = match.group(2)
+                 resids_list.append(resnum_str)
+                 chains_list.append(meta.get('chain', '?'))
+                 confidence_list.append(meta.get('confidence', 0.0))
             else:
-                graphs_cpu = prepared_data['graphs']
-                metadata = prepared_data['metadata'] # Contains resids, chains, confidence per graph
-                
-                # 2. Batch graphs and run inference on the target device
-                # print(f"    Generated {len(graphs_cpu)} graphs. Running inference...") # Debug
-                graph_batch = Batch.from_data_list(graphs_cpu).to(device)
-                
-                with torch.no_grad():
-                    # Use autocast for potential speedup/memory saving on GPU
-                    with torch.autocast(device_type=str(device.type), dtype=torch.float16, enabled=(str(device.type) == 'cuda')):
-                        embs_gpu, _ = model.online_encoder(graph_batch, return_projection=False)
-                        # Ensure output is float32 for consistency
-                        embeddings_np = embs_gpu.float().cpu().numpy()
+                 print(f"⚠️ Warning: Could not parse resid '{meta.get('resid', '')}' for {pdb_id_from_prep}. Skipping protein.")
+                 parsing_failed = True
+                 break
 
-                # 3. Verify and reconstruct the output dictionary
-                if len(metadata) != embeddings_np.shape[0]:
-                    print(f"  ⚠️ Metadata length ({len(metadata)}) mismatch with embeddings shape ({embeddings_np.shape}) for {pdb_id}.")
-                    processed_pdb_data = None
-                else:
-                    processed_pdb_data = {
-                        'id': pdb_id, # Use the cleaned pdb_id
-                        'embeddings': embeddings_np,
-                        'resids': [m['resid'] for m in metadata],
-                        'chains': [m['chain'] for m in metadata],
-                        'confidence': [m['confidence'] for m in metadata],
-                        # Add original atoms or filepath if subsequent code needs them
-                        # 'atoms': raw_pdb_data['atoms'], 
-                        # 'file_path': raw_pdb_data.get('file_path') 
-                    }
-                    # print(f"    Successfully generated embeddings. Shape: {embeddings_np.shape}") # Debug
+        if parsing_failed:
+            continue # Skip to the next protein
 
-        except Exception as e:
-            print(f"  ⚠️ Error during optimized processing for {pdb_id}: {e}")
-            # import traceback; traceback.print_exc() # Uncomment for detailed debug
-            processed_pdb_data = None
-            
-    else: # Should not happen with choices defined in argparse
-        print(f"  ⚠️ Unknown mode: {args.mode}")
-        continue
-        
-    # --- Check if processing was successful ---    
-    if processed_pdb_data is None:
-        print(f"⚠️ Skipping {pdb_id} due to processing failure in mode '{args.mode}'.")
-        continue
-        
-    # --- Continue with annotation using processed_pdb_data --- 
-    # Remove self from database if present
+        if not resids_list: # Check if lists are empty after processing metadata
+             print(f"⚠️ Skipping {pdb_id_from_prep}: No valid residues found after processing metadata.")
+             continue
+
+        pdb_data = {
+            "id": pdb_id_from_prep,
+            "resids": resids_list,
+            "chains": chains_list,
+            "embeddings": embeddings_np,
+            "confidence": confidence_list
+        }
+    # --- End of conditional processing ---
+
+    # --- Rest of the original loop logic starts here ---
+    pdb_id, af_flag = pdb_from_fname(pdb_data["id"])
+    print(f'Input PDB: {pdb_id}')
+
     if pdb_id[:4] in db_pdbcodes:
         idx_to_remove = np.where(db_pdbcodes == pdb_id[:4])[0]
-        db_pdbs = np.delete(db_pdbs, idx_to_remove)
-        db_sources = np.delete(db_sources, idx_to_remove)
-        db_labels = np.delete(db_labels, idx_to_remove)
-        db_resids = np.delete(db_resids, idx_to_remove)
-        db_embeddings = np.delete(db_embeddings, idx_to_remove, 0)
-        db_means = np.delete(db_means, idx_to_remove, 0)
-        db_stds = np.delete(db_stds, idx_to_remove, 0)
-        db_cutoffs = np.delete(db_cutoffs, idx_to_remove, 0)
-    
-    # Extract data from the processed dictionary
-    resids = np.array(processed_pdb_data['resids'])
-    chains = np.array(processed_pdb_data['chains'])
-    embeddings = np.array(processed_pdb_data['embeddings'])
-    confidences = np.array(processed_pdb_data['confidence'])
-    
+        # Use boolean indexing for robust deletion
+        keep_mask = np.ones(len(db_pdbs), dtype=bool)
+        keep_mask[idx_to_remove] = False
+
+        db_pdbs = db_pdbs[keep_mask]
+        db_sources = db_sources[keep_mask]
+        db_labels = db_labels[keep_mask]
+        db_resids = db_resids[keep_mask]
+        db_embeddings = db_embeddings[keep_mask]
+        db_means = db_means[keep_mask]
+        db_stds = db_stds[keep_mask]
+        db_cutoffs = db_cutoffs[keep_mask]
+        # Update db_pdbcodes as well after deletion
+        db_pdbcodes = db_pdbcodes[keep_mask]
+
+    resids = np.array(pdb_data['resids'])
+    chains = np.array(pdb_data['chains'])
+    embeddings = np.array(pdb_data['embeddings'])
+    confidences = np.array(pdb_data['confidence'])
+
     if af_flag:
-        print('Removing low confidence residues')
+        # TODO: Verify if confidence filtering logic needs adjustment for 'optimized' mode (b-factors).
+        print('Removing low confidence residues (threshold >= 70)')
         high_conf_idx = confidences >= 70
+        if not np.any(high_conf_idx):
+            print(f"Skipping {pdb_id} due to no high-confidence residues.")
+            continue
+
         resids = resids[high_conf_idx]
         chains = chains[high_conf_idx]
         embeddings = embeddings[high_conf_idx]
-    
+        if embeddings.shape[0] == 0:
+             print(f"Skipping {pdb_id} as no embeddings remained after confidence filtering.")
+             continue
+
     if args.chains:
         print(f'Annotating chains: {args.chains}')
         chain_idx = np.in1d(chains, np.array(list(args.chains)))
+        if not np.any(chain_idx):
+            print(f"Skipping {pdb_id} due to no matching chains.")
+            continue
+
         resids = resids[chain_idx]
         chains = chains[chain_idx]
         embeddings = embeddings[chain_idx]
-        
-    # Before cosine calculation
-    print("\nInput statistics:")
-    print(f"- Number of residues: {len(embeddings)}")
-    print(f"- Embedding dimension: {embeddings.shape[1]}")
-    print(f"- Sample embedding mean/std: {embeddings.mean():.6f}/{embeddings.std():.6f}")
-    
+        if embeddings.shape[0] == 0:
+             print(f"Skipping {pdb_id} as no embeddings remained after chain filtering.")
+             continue
+
+    if embeddings.shape[0] == 0:
+        print(f"Skipping {pdb_id} as no embeddings available for comparison.")
+        continue
+    if db_embeddings.shape[0] == 0:
+        print(f"Skipping {pdb_id} as database is empty after potential self-removal.")
+        continue
+
     cosines = fastdist.cosine_matrix_to_matrix(embeddings, db_embeddings)  # (n_res, n_db)
-    
+
     query_mask = cosines > cutoff
-    site_mask = cosines > db_cutoffs[np.newaxis, :]
-    
+    # Ensure broadcasting works correctly
+    if db_cutoffs.ndim == 1 and query_mask.ndim == 2:
+         site_mask = cosines > db_cutoffs[np.newaxis, :] # Ensure db_cutoffs is broadcast correctly
+    else:
+         print(f"Warning: Unexpected dimensions for cosine ({cosines.shape}) or db_cutoffs ({db_cutoffs.shape}). Skipping protein.")
+         continue # Skip if dimensions are wrong
+
     quantile_mask = query_mask & site_mask
 
     results = col.defaultdict(dict)
@@ -216,28 +235,30 @@ for raw_pdb_data in dataset:
         hits = np.unique(hit_idx)
         chain_res = chains[i] + '_' + resids[i]
         for h in hits:
-            key = (db_labels[h], db_sources[h])
-            if chain_res in results[key]:
-                results[key][chain_res].add(f'{db_pdbs[h]}: {db_resids[h]}')
-            else:
-                results[key][chain_res] = set([f'{db_pdbs[h]}: {db_resids[h]}'])
-    
-    # After cosine calculation
-    print("\nSimilarity statistics:")
-    print(f"- Cosine matrix shape: {cosines.shape}")
-    print(f"- Max similarity: {cosines.max():.6f}")
-    print(f"- Mean similarity: {cosines.mean():.6f}")
-    print(f"- Number of hits above cutoff: {query_mask.sum()}")
-    print(f"- Number of hits above site cutoff: {site_mask.sum()}")
-    print(f"- Number of final hits: {quantile_mask.sum()}")
+            # Make sure index h is valid for DB arrays
+            if h >= len(db_labels):
+                 print(f"Warning: DB index {h} out of bounds for protein {pdb_id}. Skipping hit.")
+                 continue
 
-    # After processing hits
-    print("\nResults statistics:")
-    print(f"- Number of result keys: {len(results)}")
-    for (name, source), sites in results.items():
-        print(f"- {name} ({source}): {sum(len(pdbs) for pdbs in sites.values())} total hits")
-        for loc, pdbs in sites.items():
-            if args.verbose:
-                print(f"    - {loc}: {pdbs}")
+            key = (db_labels[h], db_sources[h])
+            # Safely access DB info
+            db_pdb_info = db_pdbs[h] if h < len(db_pdbs) else 'DB_PDB_?'
+            db_resid_info = db_resids[h] if h < len(db_resids) else 'DB_RESID_?'
+            hit_info_str = f'{db_pdb_info}: {db_resid_info}'
+
+            if chain_res in results[key]:
+                results[key][chain_res].add(hit_info_str)
             else:
-                print(f"    - {loc}: {len(pdbs)} PDBs")
+                results[key][chain_res] = set([hit_info_str])
+    
+    print('Results at p = ', args.cutoff)
+    if not results:
+        print(" No significant hits found.")
+    else:
+        for (name, source), sites in results.items():
+            print(f' {name} ({source})')
+            for loc, pdbs in sites.items():
+                if args.verbose:
+                    print(f"    - {loc}: {pdbs}")
+                else:
+                    print(f"    - {loc}: {len(pdbs)} PDBs")
