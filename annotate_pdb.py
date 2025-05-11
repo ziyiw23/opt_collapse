@@ -12,7 +12,7 @@ from torch_geometric.data import Batch
 
 # Import original transform
 from collapse.data import EmbedTransform as OriginalEmbedTransform
-from embedding_utils import GraphPreparationTransformCPU
+from collapse.embedding_utils import GraphPreparationTransformCPU
 
 parser = argparse.ArgumentParser()
 parser.add_argument('pdb', type=str, nargs='+')

@@ -35,7 +35,7 @@ try:
     import atom3d.util.formats as fo # For reading PDB
 
     # Import necessary functions directly from embedding_utils
-    from embedding_utils import (
+    from collapse.embedding_utils import (
         _element_mapping, _normalize, _rbf, _edge_features,
         sample_functional_center, # Uses atom_info
         ELEMENT_MAPPING, DEFAULT_ELEMENT # Constants
@@ -61,7 +61,7 @@ except ImportError as e:
     # Add fallback dummy functions or raise error if crucial parts are missing
     raise(e) # Re-raise error to stop execution if imports fail
 
-from worker_functions import global_worker_task_executor, _process_residue_env_worker # We will adapt its usage
+from collapse.worker_functions import global_worker_task_executor, _process_residue_env_worker # We will adapt its usage
 
 # --- Try to set start method as early as possible ---
 # Ensure this is called before any torch imports if they are not at the top, 
@@ -138,7 +138,7 @@ atexit.register(cleanup_memmap_files_on_exit)
 # %%
 # --- Parameters ---
 # <<< USER: SET YOUR PDB FILE HERE >>>
-PDB_FILE_PATH = "/scratch/groups/rbaltman/ziyiw23/clps_pdbs/MGYP000002588102.pdb"
+PDB_FILE_PATH = "/scratch/groups/rbaltman/ziyiw23/exp_conform/MGYP000002588102.pdb"
 # Checkpoint for the COLLAPSE model
 CHECKPOINT_PATH = 'data/checkpoints/collapse_base.pt'
 # Radius to define the local environment around each residue's center
@@ -1017,17 +1017,297 @@ def generate_single_pdb_embedding_ray(atom_df_input: pd.DataFrame, protein_id_in
     print("-" * 30)
     return embeddings_np, metadata_list, total_time_taken
 
+def generate_single_pdb_embedding_optimized(atom_df_input: pd.DataFrame, protein_id_input: str,
+                                  model_main_process, device_main_process,
+                                  include_hets=INCLUDE_HETS,
+                                  env_radius=ENV_RADIUS,
+                                  edge_cutoff=EDGE_CUTOFF,
+                                  num_rbf=NUM_RBF,
+                                  num_workers=NUM_WORKERS,
+                                  use_ray=False):
+    """
+    Optimized embedding generation that chooses between multiprocessing and Ray
+    based on system configuration and worker count.
+    
+    Args:
+        atom_df_input: DataFrame with protein atom data
+        protein_id_input: Protein identifier
+        model_main_process: Model instance for inference
+        device_main_process: Target device for inference
+        include_hets: Whether to include heteroatoms
+        env_radius: Radius for residue environment
+        edge_cutoff: Edge cutoff for graph creation
+        num_rbf: Number of radial basis functions
+        num_workers: Number of workers to use
+        use_ray: Force use of Ray if True, otherwise auto-select
+        
+    Returns:
+        tuple: (embeddings, metadata, duration)
+    """
+    # Choose implementation based on system configuration
+    if not use_ray and num_workers <= os.cpu_count():
+        return generate_single_pdb_embedding_threads(
+            atom_df_input, protein_id_input, model_main_process, device_main_process,
+            include_hets, env_radius, edge_cutoff, num_rbf, num_workers
+        )
+    else:
+        return generate_single_pdb_embedding_ray(
+            atom_df_input, protein_id_input, model_main_process, device_main_process,
+            include_hets, env_radius, edge_cutoff, num_rbf, num_workers
+        )
+
+def generate_single_pdb_embedding_threads(atom_df_input: pd.DataFrame, protein_id_input: str,
+                                    model_main_process, device_main_process,
+                                    include_hets=INCLUDE_HETS,
+                                    env_radius=ENV_RADIUS,
+                                    edge_cutoff=EDGE_CUTOFF,
+                                    num_rbf=NUM_RBF,
+                                    num_workers=NUM_WORKERS):
+    """
+    Generate embeddings using optimized multiprocessing with shared memory.
+    Incorporates memory safety fixes but uses efficient thread-based parallelism.
+    """
+    overall_start_time = time.perf_counter()
+    print("-" * 30)
+    print(f"Starting OPTIMIZED thread-based embedding generation for: {protein_id_input}")
+    print(f"Parameters: EnvRadius={env_radius}, EdgeCutoff={edge_cutoff}, IncludeHets={include_hets}, Workers={num_workers}")
+    print("-" * 30)
+
+    # --- 1. Load and Preprocess PDB (Main Process) ---
+    current_step_start_time = time.perf_counter()
+    atom_df = None
+    try:
+        atom_df = atom_df_input.copy()
+        if atom_df is None or atom_df.empty:
+            raise ValueError(f"Input atom_df_input is None or empty for {protein_id_input}")
+
+        atom_df = first_model_filter(atom_df)
+        atom_df = atom_df[~atom_df.hetero.str.contains('W', na=False)]
+        atom_df = atom_df[atom_df['element'] != 'H']
+        if not include_hets:
+            if hasattr(atom_info, 'aa') and isinstance(atom_info.aa, (list, set)):
+                if 'resname' in atom_df.columns:
+                    atom_df = atom_df[atom_df.resname.isin(atom_info.aa)]
+                else:
+                    print(f"Warning: 'resname' column missing, cannot filter hets for {protein_id_input}.")
+            else:
+                print("Warning: atom_info.aa not found, cannot filter hets.")
+        atom_df = atom_df.reset_index(drop=True)
+        if atom_df.empty: raise ValueError(f"PDB empty after filtering: {protein_id_input}")
+        
+        essential_cols = {'resname', 'chain', 'residue', 'element', 'x', 'y', 'z', 'name', 'bfactor'}
+        missing_cols = essential_cols - set(atom_df.columns)
+        if missing_cols: raise ValueError(f"Missing essential columns: {missing_cols}")
+        atom_df['id'] = protein_id_input
+        atom_df['residue'] = pd.to_numeric(atom_df['residue']) # Ensure residue is numeric
+        print(f"Step 1: Loaded and preprocessed. Atoms: {len(atom_df)}. Time: {time.perf_counter() - current_step_start_time:.4f}s")
+    except Exception as e:
+        print(f"Error in Step 1: {e}"); traceback.print_exc(); return None, None, time.perf_counter() - overall_start_time
+
+    # --- 2. Build KDTree (Main Process) ---
+    kdtree = None
+    current_step_start_time = time.perf_counter()
+    try:
+        coords_for_kdtree = np.ascontiguousarray(atom_df[['x', 'y', 'z']].to_numpy(dtype=np.float32))
+        if coords_for_kdtree.shape[0] == 0: raise ValueError("No coords for KDTree.")
+        kdtree = scipy.spatial.cKDTree(coords_for_kdtree, compact_nodes=True, copy_data=False)
+        print(f"Step 2: Built KDTree for {kdtree.n} atoms. Time: {time.perf_counter() - current_step_start_time:.4f}s")
+    except Exception as e:
+        print(f"Error in Step 2: {e}"); traceback.print_exc(); return None, None, time.perf_counter() - overall_start_time
+
+    # --- 3. Identify Residues (Main Process) ---
+    residue_keys_for_tasks = []
+    current_step_start_time = time.perf_counter()
+    try:
+        if atom_info.aa_to_letter_dict:
+            atom_df['resname_letter'] = atom_df['resname'].map(atom_info.aa_to_letter_dict)
+        else:
+            atom_df['resname_letter'] = atom_df['resname'].apply(atom_info.aa_to_letter)
+        
+        residue_info_df = atom_df[['chain', 'residue', 'resname_letter', 'bfactor']].drop_duplicates(subset=['chain', 'residue'])
+        standard_letters = set(atom_info.aa_abbr) - {'X'} if hasattr(atom_info, 'aa_abbr') else set('ACDEFGHIKLMNPQRSTVWY')
+        residue_info_df = residue_info_df[residue_info_df['resname_letter'].isin(standard_letters) & residue_info_df['resname_letter'].notna()]
+        if residue_info_df.empty: raise ValueError(f"No standard AA residues found in {protein_id_input}.")
+
+        residue_keys_for_tasks = [
+            (protein_id_input, row['chain'], row['residue'], row['resname_letter'], row['bfactor'])
+            for _, row in residue_info_df.iterrows()
+        ]
+        print(f"Step 3: Identified {len(residue_keys_for_tasks)} standard residues. Time: {time.perf_counter() - current_step_start_time:.4f}s")
+    except Exception as e:
+        print(f"Error in Step 3: {e}"); traceback.print_exc(); return None, None, time.perf_counter() - overall_start_time
+
+    # --- 4. Prepare Shared Memory (Optimized) ---
+    print("Step 4a: Preparing shared memory arrays...")
+    current_step_start_time = time.perf_counter()
+    
+    # Convert coordinates to contiguous array
+    all_coords_np_orig = np.ascontiguousarray(atom_df[['x', 'y', 'z']].to_numpy(dtype=np.float32))
+    all_elements_np_orig = np.ascontiguousarray(atom_df['element'].to_numpy(dtype='<U4'))  # Using safer fixed-width strings
+    
+    # Create shared memory for coordinates and elements
+    shm_coords = shared_memory.SharedMemory(create=True, size=all_coords_np_orig.nbytes)
+    shm_elements = shared_memory.SharedMemory(create=True, size=all_elements_np_orig.nbytes)
+    
+    # Create numpy arrays that use the shared memory buffers
+    coords_shape = all_coords_np_orig.shape
+    coords_dtype = all_coords_np_orig.dtype
+    elements_shape = all_elements_np_orig.shape
+    elements_dtype = all_elements_np_orig.dtype
+    
+    # Copy data to shared memory arrays
+    shared_coords_np = np.ndarray(coords_shape, dtype=coords_dtype, buffer=shm_coords.buf)
+    shared_elements_np = np.ndarray(elements_shape, dtype=elements_dtype, buffer=shm_elements.buf)
+    np.copyto(shared_coords_np, all_coords_np_orig)
+    np.copyto(shared_elements_np, all_elements_np_orig)
+    
+    # Prepare chain-specific DataFrames needed by _process_residue_env_worker
+    chain_atom_dfs_global = {chain: group for chain, group in atom_df.groupby('chain')}
+    
+    print(f"Step 4a: Shared memory prepared. Time: {time.perf_counter() - current_step_start_time:.4f}s")
+
+    # --- 4b. Process Residue Environments in Parallel ---
+    print(f"Step 4b: Processing {len(residue_keys_for_tasks)} residue environments with {num_workers} workers...")
+    current_step_start_time = time.perf_counter()
+    
+    # Prepare worker arguments - shared memory info
+    worker_args_list = []
+    for residue_key in residue_keys_for_tasks:
+        worker_args = (
+            residue_key,
+            shm_coords.name, coords_shape, coords_dtype,
+            shm_elements.name, elements_shape, elements_dtype,
+            chain_atom_dfs_global, kdtree, env_radius
+        )
+        worker_args_list.append(worker_args)
+    
+    # Process environments in parallel
+    with multiprocessing.Pool(num_workers, initializer=worker_init_fn) as pool:
+        # Use imap instead of map to get results as they complete
+        # This avoids accumulating all results in memory at once
+        worker_results_iter = pool.imap(global_worker_task_executor, worker_args_list)
+        
+        # Collect results - gather valid ones
+        cpu_pool_results = []
+        for result in worker_results_iter:
+            if result is not None and result[0] is not None:
+                cpu_pool_results.append(result)
+    
+    print(f"Step 4b: Processed residue environments. Valid results: {len(cpu_pool_results)}. Time: {time.perf_counter() - current_step_start_time:.4f}s")
+    
+    # Clean up shared memory
+    try:
+        shm_coords.close()
+        shm_coords.unlink()
+        shm_elements.close()
+        shm_elements.unlink()
+    except Exception as e_shm:
+        print(f"Warning: Error cleaning up shared memory: {e_shm}")
+    
+    # --- 4.5 Create GPU Graphs (Main Process) ---
+    if not cpu_pool_results:
+        print("Error: No environments identified by workers.")
+        return None, None, time.perf_counter() - overall_start_time
+
+    print(f"Step 4.5: Creating {len(cpu_pool_results)} PyG graphs on GPU ({device_main_process})...")
+    current_step_start_time = time.perf_counter()
+    gpu_graphs_list = []
+    final_metadata_list = []
+
+    for result_item in cpu_pool_results:
+        # Expected item: (metadata, env_data)
+        metadata, env_data = result_item
+        if metadata is None or env_data is None:
+            continue
+            
+        env_coords_np, env_elements_np = env_data
+            
+        gpu_graph = create_pyg_graph_on_gpu(env_coords_np, env_elements_np,
+                                          device_main_process, edge_cutoff, num_rbf)
+        if gpu_graph:
+            gpu_graphs_list.append(gpu_graph)
+            final_metadata_list.append(metadata)
+
+    if not gpu_graphs_list:
+        print("Error: Failed to create any graphs on GPU from worker results.")
+        return None, (final_metadata_list if final_metadata_list else None), time.perf_counter() - overall_start_time
+    
+    print(f"Step 4.5: Created {len(gpu_graphs_list)} graphs on GPU. Time: {time.perf_counter() - current_step_start_time:.4f}s")
+    metadata_list = final_metadata_list
+
+    # --- 5. Batch Graphs (Similar to Ray version) ---
+    graph_batch_gpu = None
+    current_step_start_time = time.perf_counter()
+    try:
+        graph_batch_gpu = Batch.from_data_list(gpu_graphs_list)
+        graph_batch_gpu = graph_batch_gpu.to(device_main_process)
+        print(f"Step 5: Batching complete. Batch is on device: {graph_batch_gpu.x.device}. Time: {time.perf_counter() - current_step_start_time:.4f}s")
+    except Exception as e:
+        print(f"Error in Step 5: {e}"); traceback.print_exc()
+        return None, metadata_list, time.perf_counter() - overall_start_time
+    finally:
+        if gpu_graphs_list: del gpu_graphs_list
+
+    # --- 6. Run Model Inference (Same as Ray version) ---
+    print(f"Step 6: Running inference on device {device_main_process}...")
+    current_step_start_time = time.perf_counter()
+    embeddings_np = None
+    try:
+        model_setup_time = time.perf_counter()
+        print(f"  Moving model to {device_main_process} (if not already there)...")
+        model_main_process.to(device_main_process)
+        print(f"  Model on device. Time: {time.perf_counter() - model_setup_time:.4f}s")
+
+        if COMPILE_MODEL and hasattr(torch, 'compile') and not isinstance(model_main_process, torch.jit.ScriptModule) and not model_main_process.__class__.__name__.endswith("CompiledModule"):
+            compile_start_time = time.perf_counter()
+            print("  Compiling model on target device (this may take a moment)...")
+            try:
+                model_main_process = torch.compile(model_main_process, mode="reduce-overhead")
+                print(f"  Model compiled successfully on target device. Time: {time.perf_counter() - compile_start_time:.4f}s")
+            except Exception as e_compile:
+                print(f"  Warning: Model compilation on {device_main_process} failed: {e_compile}")
+        
+        actual_inference_start_time = time.perf_counter()
+        model_main_process.eval()
+        with torch.no_grad():
+            with torch.autocast(device_type=str(device_main_process.type), dtype=torch.float16, enabled=(str(device_main_process.type) == 'cuda')):
+                embs, _ = model_main_process.online_encoder(graph_batch_gpu, return_projection=False)
+                embeddings_np = embs.float().cpu().numpy()
+        
+        print(f"  Actual inference. Time: {time.perf_counter() - actual_inference_start_time:.4f}s")
+        print(f"Step 6: Inference finished. Output shape: {embeddings_np.shape}. Total Step 6 Time: {time.perf_counter() - current_step_start_time:.4f}s")
+        if embeddings_np.shape[0] != len(metadata_list):
+            raise ValueError(f"Embedding count mismatch: Expected {len(metadata_list)}, Got {embeddings_np.shape[0]}.")
+    except RuntimeError as e_rt:
+        if "CUDA out of memory" in str(e_rt): print("CUDA OOM during inference!")
+        else: print(f"Runtime error during inference: {e_rt}")
+        traceback.print_exc()
+        return None, metadata_list, time.perf_counter() - overall_start_time
+    except Exception as e_inf:
+        print(f"Error in Step 6 (Inference): {e_inf}"); traceback.print_exc()
+        return None, metadata_list, time.perf_counter() - overall_start_time
+    finally:
+        if graph_batch_gpu is not None: del graph_batch_gpu
+        if 'embs' in locals(): del embs
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    # --- 7. Return Results ---
+    total_time_taken = time.perf_counter() - overall_start_time
+    print("-" * 30)
+    print(f"OPTIMIZED pipeline finished successfully for {protein_id_input}.")
+    print(f"Total processing time (perf_counter): {total_time_taken:.4f} seconds.")
+    print("-" * 30)
+    return embeddings_np, metadata_list, total_time_taken
 
 def run_pipeline():
-    # REMOVED: multiprocessing.set_start_method, handled by Ray internals or not needed.
+    # Set up device for inference
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     if torch.cuda.is_available(): print(f"Found {torch.cuda.device_count()} CUDA devices.")
 
     print("Loading model for main process...")
-    # Model is loaded once here and passed to generate_single_pdb_embedding_ray
-    # It stays on the CPU initially if CHECKPOINT_PATH implies CPU, or moved to device later.
-    # For Ray, the main model is only used in the main process.
+    # Model is loaded once here and passed to generate_single_pdb_embedding functions
+    # It stays on the CPU initially, or moved to device later as needed
     model_main = initialize_model(CHECKPOINT_PATH, device=cpu_device) # Keep on CPU first
     model_main.eval()
     print("Model loaded on CPU for main process.")
@@ -1046,18 +1326,66 @@ def run_pipeline():
         profiler = cProfile.Profile()
         profiler.enable()
 
-        # Call the Ray-based embedding function
-        embeddings, metadata, duration = generate_single_pdb_embedding_ray(
+        # Benchmark all implementations for comparison
+        print("\n=== PERFORMANCE BENCHMARKS ===")
+        
+        # 1. Run optimized (threads) implementation - should be fastest for most cases
+        print("\n[1] RUNNING OPTIMIZED (THREAD-BASED) IMPLEMENTATION:")
+        embeddings_opt, metadata_opt, duration_opt = generate_single_pdb_embedding_optimized(
             atom_df_for_testing,
             protein_id_for_testing,
-            model_main, # Pass the model loaded in main process
-            device,     # Pass the target device for GPU steps in main process
+            model_main,
+            device,
             include_hets=INCLUDE_HETS,
             env_radius=ENV_RADIUS,
             edge_cutoff=EDGE_CUTOFF,
             num_rbf=NUM_RBF,
-            num_workers=NUM_WORKERS
+            num_workers=NUM_WORKERS,
+            use_ray=False  # Force thread-based implementation
         )
+        
+        print(f"\nTHREAD-BASED PERFORMANCE: {duration_opt:.3f} seconds")
+        if embeddings_opt is not None:
+            print(f"Thread-based generated {len(metadata_opt)} embeddings of shape {embeddings_opt.shape}")
+        
+        # 2. Run Ray implementation for comparison
+        print("\n[2] RUNNING RAY IMPLEMENTATION FOR COMPARISON:")
+        embeddings_ray, metadata_ray, duration_ray = generate_single_pdb_embedding_optimized(
+            atom_df_for_testing,
+            protein_id_for_testing,
+            model_main,
+            device,
+            include_hets=INCLUDE_HETS,
+            env_radius=ENV_RADIUS,
+            edge_cutoff=EDGE_CUTOFF,
+            num_rbf=NUM_RBF,
+            num_workers=NUM_WORKERS,
+            use_ray=True  # Force Ray implementation
+        )
+        
+        print(f"\nRAY-BASED PERFORMANCE: {duration_ray:.3f} seconds")
+        if embeddings_ray is not None:
+            print(f"Ray-based generated {len(metadata_ray)} embeddings of shape {embeddings_ray.shape}")
+        
+        # Compare results
+        if embeddings_opt is not None and embeddings_ray is not None:
+            # This is not necessary but helps validate implementations match
+            try:
+                embedding_similarity = np.mean(np.abs(embeddings_opt - embeddings_ray))
+                print(f"\nEmbedding similarity (MAE): {embedding_similarity:.6f}")
+                if embedding_similarity < 1e-5:
+                    print("Implementations produce numerically equivalent results (as expected)")
+                else:
+                    print("WARNING: Implementations produce slightly different results")
+            except:
+                print("Could not compare embeddings (different shapes or one is None)")
+        
+        print("\n=== BENCHMARK SUMMARY ===")
+        print(f"Thread-based: {duration_opt:.3f}s, Ray-based: {duration_ray:.3f}s")
+        print(f"Speedup: {duration_ray/duration_opt:.2f}x faster with optimized implementation")
+        
+        # Use the optimized implementation results
+        embeddings, metadata, duration = embeddings_opt, metadata_opt, duration_opt
 
         profiler.disable()
         print("Programmatic profiling finished.")
@@ -1090,12 +1418,20 @@ def run_pipeline():
         stats_cumtime = pstats.Stats(profiler).sort_stats('cumtime')
         stats_cumtime.print_stats(20)
         
-        profiler_output_file = "programmatic_profile_ray.prof"
+        profiler_output_file = "programmatic_profile_optimized.prof"
         profiler.dump_stats(profiler_output_file)
         print(f"\nFull profiler data saved to {profiler_output_file}")
 
 if __name__ == '__main__':
-    # Ray init/shutdown is handled within generate_single_pdb_embedding_ray 
-    # or could be global if multiple calls were made. For one PDB, inside is fine.
-    cpu_device = torch.device('cpu') # Define for model loading
+    # Define cpu_device here for global access
+    cpu_device = torch.device('cpu')
+    
+    # CPU count validation: safety check
+    available_cpus = os.cpu_count()
+    if NUM_WORKERS > available_cpus:
+        print(f"Warning: NUM_WORKERS ({NUM_WORKERS}) exceeds available CPU count ({available_cpus})")
+        print(f"Reducing worker count to {available_cpus}")
+        NUM_WORKERS = available_cpus
+    
+    # Run the benchmark pipeline with both implementations
     run_pipeline()

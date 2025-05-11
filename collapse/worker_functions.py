@@ -10,7 +10,7 @@ import time # ADDED for timing in workers
 
 # Import necessary functions from embedding_utils
 try:
-    from embedding_utils import (
+    from collapse.embedding_utils import (
         _element_mapping, _normalize, _rbf, _edge_features,
         sample_functional_center
     )

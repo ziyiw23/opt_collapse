@@ -30,7 +30,7 @@ import sys
 # from torch.nn.parallel import DistributedDataParallel as DDP
 
 # --- Import from utils --- ## MODIFIED ##
-from embedding_utils import (
+from collapse.embedding_utils import (
     BaseTransform, GraphPreparationTransformCPU, TransformedDatasetWrapper,
     graph_collate_fn # Now returns 4 items
 )

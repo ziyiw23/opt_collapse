@@ -49,7 +49,7 @@ from collapse.data import (
     sample_functional_center # Shared function
 )
 from collapse import initialize_model
-from embedding_utils import (
+from collapse.embedding_utils import (
     GraphPreparationTransformCPU,
     TransformedDatasetWrapper,
     graph_collate_fn # The one returning 4 items

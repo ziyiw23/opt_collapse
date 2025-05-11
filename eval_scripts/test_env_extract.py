@@ -21,7 +21,7 @@ from collapse.data import process_pdb, extract_env_from_resid, atom_info, sample
 from collapse.data import transform as original_global_transform 
 
 # --- Optimized Pipeline Imports ---
-from embedding_utils import extract_env_for_residue_cpu, BaseTransform as OptimizedBaseTransform
+from collapse.embedding_utils import extract_env_for_residue_cpu, BaseTransform as OptimizedBaseTransform
 
 def compare_numpy_arrays(name, arr1, arr2, rtol=1e-5, atol=1e-8):
     print(f"\n--- Comparing NumPy Array: {name} ---")
