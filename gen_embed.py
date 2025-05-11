@@ -238,7 +238,19 @@ def main():
                 with torch.autocast(device_type=str(device.type), dtype=torch.float16, enabled=(str(device.type) == 'cuda')):
                     # Call model directly (DP wrapper handles it)
                     # Or access original methods via model.module if needed, but usually direct call works
-                    embs = model.online_network(graph_batch_gpu)
+                    # Use online_encoder and expect a tuple (embeddings, projection)
+                    # We only need the embeddings, so set return_projection=False
+                    # The OOM fallback suggests online_encoder might be on model.module if DataParallel is used,
+                    # but DataParallel should forward calls. The error is on BYOL itself.
+                    if isinstance(model, nn.DataParallel):
+                        network_output = model.module.online_encoder(graph_batch_gpu, return_projection=False)
+                    else:
+                        network_output = model.online_encoder(graph_batch_gpu, return_projection=False)
+
+                    if isinstance(network_output, tuple):
+                        embs = network_output[0]
+                    else: # Should ideally be a tuple, but handle if not for robustness
+                        embs = network_output
                     # Ensure embeddings are float32 for consistent saving
                     final_embs_np = embs.float().cpu().numpy()
                 processed_residue_count += final_embs_np.shape[0]
