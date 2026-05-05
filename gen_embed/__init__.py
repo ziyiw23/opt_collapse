@@ -1,0 +1,1 @@
+"""Optimized embedding generation entrypoints."""
